@@ -1158,6 +1158,77 @@ force. Then per-step displacement is sub-Lth by construction and the §6j "in-in
 trust-region/clamp" port note is **unnecessary** — there is no overshoot to clamp. This both closes
 the science gap and removes a planned C++ departure.
 
+## 6o. Native active-motility drive — the Python `add_noise_active` port is COMPLETE (DONE & GATED, 2026-06-13)
+
+Phase 3's one remaining non-native piece — the active self-propulsion "noise" drive (§6n), which
+lived in the Python harness (`sort_periodic_oracle.py::add_noise_active`, injected via
+`v.set_position` before each `tf.step()`) — is now **native in C++** on the fork
+`feat/native-rnr-reconnection`. The faithful RNR + active cell-sorting capability runs **entirely
+inside TissueForge**; the Python injection is retired to a comparison fallback. This completes the
+project's actual deliverable.
+
+**The model (re-derived, §6n; nothing copied from GPL `Run.cpp`):** unchanged from the harness —
+per-cell director `n_c ∈ S²`, active-Brownian rotational diffusion `n ← normalize(n + √(2·Dr·dt)(ξ−n))`
+(ξ uniform on S², the ONLY √dt term, on *orientation*), per-vertex active velocity `v0·⟨n_c⟩` over
+the incident cells.
+
+**The seam / mapping (the crux).** TissueForge's vertex integrator is OVERDAMPED
+(`mdcore/src/tf_engine_advance.cpp`, the `dynamics != PARTICLE_NEWTONIAN` branch: `dx = dt·f·imass`),
+and vertex particles have **mass = 1** (`MeshParticleType` is `PARTICLE_OVERDAMPED`; density 0 ⇒
+`Vertex::getMass()=0` ⇒ `updateProperties` keeps the default unit mass ⇒ `imass=1`, **μ=1**, per §6f
+and the new calibration). So adding a per-vertex **force** `f = v0·⟨n_c⟩` yields displacement
+`dt·v0·⟨n_c⟩` — *exactly* the oracle's `dt·motility` (Run.cpp:1345) — in the engine's single overdamped
+update, alongside the deterministic mesh forces. The engine wraps PBC during the advance, so the
+harness's `% L` is dropped; it maintains vertex↔cell adjacency live, so the harness's per-step
+`_rebuild_incidence` + the net-zero-count stale-handle workaround are unneeded. The native drive is
+strictly simpler and more robust than the harness.
+
+**Implementation (C++ on the fork):**
+- `Body::director` (`FVector3`) + `getDirector`/`setDirector` (normalizes; `{0,0,0}` = unset
+  sentinel). Mirrors the per-cell-state `orientSign` precedent (§6k). **Not serialized** (like
+  orientSign — recomputed/re-seeded; no save/restore mid-run in any gate; a known limitation).
+- `MeshSolver::setMotility(v0, Dr=1, seed=-1)` + `getMotilityV0/Dr`, backed by a **dedicated**
+  reproducible `std::mt19937` (does NOT perturb `tf.Force.random`'s RNG stream). `v0=0` by default ⇒
+  drive OFF ⇒ existing runs unchanged. `setMotility` seeds all current bodies' directors random-on-S².
+- Director **evolution**: a serial loop at the top of `MeshSolver::preStepStart` (once per step,
+  BEFORE the parallel force pass) so the force read sees freshly-rotated directors with no data race.
+- Active **force**: folded into `VertexForce`'s existing incident-body loop — accumulate the director
+  sum/count, then `force += v0·⟨n⟩` (flows through `preStepJoin → p->f`). No-op when `v0=0`.
+- SWIG: `MeshSolver.set_motility/get_motility_v0/get_motility_dr` (snake_case) + a `body.director`
+  property on Body/BodyHandle. Forced regen by `rm`-ing the generated
+  `tissue_forgePYTHON_wrap.cxx` (memory `tf-swig-subi-needs-forced-regen`).
+
+**Harness:** `sort_periodic_oracle.py` (`NOISE_MODEL=native`) + `probe_active_motility.py`
+(`MODEL=native`) call `MeshSolver.set_motility(v0, Dr, seed)` once and do **nothing per step** (the
+engine drives motility inside `tf.step()`). `active` (Python injection) is kept as the side-by-side
+comparison; `thermal` is legacy. native and Python-`active` are *statistically* equivalent (a
+different RNG stream → not bit-identical, but matching rate/demixing). New: `probe_native_calibration.py`,
+`rnr/tests/test_native_motility.py`.
+
+**GATES (2026-06-13):**
+1. **Build + smoke**: `pixi run build-tf` clean (only pre-existing Magnum deprecation warnings);
+   `pixi run verify` OK; `MeshSolver.set_motility` + `body.director` reachable from Python.
+2. **Calibration** (`probe_native_calibration.py`): per-vertex displacement = `dt·v0·⟨n⟩`
+   (median |d_act|/|pred| = **1.000**, cos = **1.000** ⇒ μ=1 + force scaling exact); director
+   rotational-diffusion rate scales with Dr (rate(Dr=2)/rate(Dr=1) = **2.08** ≈ 2; implied Dr_eff
+   1.10/2.28 — the leading-order `rate=(2/3)Dr` plus an O(s⁴) systematic).
+3. **Rate, clamp-free, NATIVE** (`probe_active_motility.py … native`): M=4 σ=0.5 → **recon=37**
+   (Python-active 35), M=6 → **146** (active 141), both **STABLE**. Matches §6n.
+4. **`pixi run test` = 49 green** (was 47): all reversibility / Condition-4 / periodic-dynamics
+   tests stay green + `test_native_motility.py` (native rate band + calibration PASS).
+5. **Science** (`sort_periodic_oracle.py … native`, M=6 seed 7, 40k steps, run_overnight params
+   CUT=1.9/DT=1e-3/CLAMP=0): σ-ordered area-demixing **S_area = {0.031, 0.035, 0.101}** for σ =
+   {0.1, 0.2, 0.5} (strong σ resolves clearly; matches §6n's 100k {0.022, 0.057, 0.116} trend —
+   low-σ separation needs the 3-seed ensemble), all STABLE; the **demixed IC HELD** (σ=0.5: D stays
+   −0.55 ⇒ DP/DP_max ≈ 0.55/0.56 ≈ **0.98**, hetA 0.207→0.161) vs the mixed IC's DP ≈ 0; and
+   **native ≈ active** at σ=0.5 (S_area 0.101 vs 0.105, recon 302 vs 299, hetA endpoints 0.473 vs
+   0.471) — direct proof the native drive reproduces the validated Python-active dynamics. Remaining
+   polish: regenerate the canonical fig1e/fig1f PNGs with the native drive (point `run_overnight.py`
+   at `native` + rerun the 100k×3-seed ensemble; `fig1e/fig1f` then need a `MODEL=native` CSV
+   selector) — `pixi run overnight` as written still uses `active`.
+6. `NOISE_MODEL=native` is now the `sort_periodic_oracle.py` **default** (production path); Python
+   `add_noise_active` (`NOISE_MODEL=active`) is kept only as the comparison fallback.
+
 ## 7. (Phase 2) Stability of reconnection-under-dynamics — DIAGNOSED
 **(SUPERSEDED in part — see §6c: the "winding sign-flip" below is the SYMPTOM; the CAUSE is a
 per-vertex displacement overshoot, either a periodic-image wrap (corner cluster) or a

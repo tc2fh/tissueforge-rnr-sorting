@@ -43,6 +43,10 @@ DR = float(sys.argv[7]) if len(sys.argv) > 7 else 1.0     # rotational diffusion
 M = int(sys.argv[8]) if len(sys.argv) > 8 else 4
 SEED = int(sys.argv[9]) if len(sys.argv) > 9 else 7
 INTERVAL = int(sys.argv[10]) if len(sys.argv) > 10 else 10
+# MODEL: "active" (default) drives motility from Python (add_noise below); "native" hands it to
+# the C++ engine (MeshSolver.set_motility, PORTING_NOTES §6o) and add_noise becomes a no-op. Both
+# are the SAME active model, so the reconnection rate should match.
+MODEL = sys.argv[11] if len(sys.argv) > 11 else "active"
 
 L = float(M)
 BOX = [[0.0, L]] * 3
@@ -98,6 +102,9 @@ q.collision_2d = False
 mesh.quality = q
 mesh.periodic_geometry = True
 
+if MODEL == "native" and V0 > 0:
+    tfv.MeshSolver.set_motility(V0, DR, SEED + 2)  # native C++ active drive (PORTING_NOTES §6o)
+
 # --- active-motility state: one director per CELL (body), persistent across steps -------------
 rng_dir = np.random.default_rng(SEED + 2)
 _dirs = rng_dir.normal(0.0, 1.0, (len(bodies), 3))
@@ -129,8 +136,8 @@ def _rebuild_incidence():
 
 
 def add_noise():
-    if V0 <= 0:
-        return
+    if V0 <= 0 or MODEL == "native":
+        return  # native: the C++ engine drives motility inside tf.step()
     # Rebuild handles+incidence from the LIVE mesh every step: a single doQuality pass can do
     # several I->H (+1 vertex) and H->I (-1) that NET to zero count change, so num_vertices is an
     # unsafe staleness signal -- a cached deleted handle then segfaults on v.position. (Re-fetching
@@ -162,7 +169,7 @@ def vols():
 
 
 per_step_disp = DT * V0  # upper bound on per-step active displacement magnitude
-print(f"ACTIVE-MOTILITY PROBE (no clamp) sigma={SIGMA} v0={V0} Lth={LTH} dt={DT} cut={CUT} "
+print(f"ACTIVE-MOTILITY PROBE [{MODEL}] (no clamp) sigma={SIGMA} v0={V0} Lth={LTH} dt={DT} cut={CUT} "
       f"Dr={DR} M={M} N={len(bodies)} steps={STEPS} | per-step disp<= {per_step_disp:.2e} "
       f"({per_step_disp / LTH:.3f}x Lth)", flush=True)
 worst_min, worst_max = float("inf"), 0.0

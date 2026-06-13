@@ -13,23 +13,34 @@ morphogenesis (Okuda-style volume growth, monolayer→multilayer) is also **late
 
 Do NOT scope-creep into growth or the C++ port unless explicitly asked.
 
-## Current status (2026-06-12) — the Phase-2 goal is REPRODUCED ✅
+## Current status (2026-06-13) — Phase-2 REPRODUCED ✅ + the active drive is now fully NATIVE ✅
 
 3DVertVor/Manning **Fig 1E + 1F are reproduced** in TissueForge's 3D vertex model, faithfully
 (clamp-free), with the native 3D I↔H reconnection supplying the missing 3D T1. Phases 0–2 (below)
-are done; Phase 3 (standalone C++ port hardening) and growth remain **later**.
+are done. **Phase 3 (2026-06-13): the active self-propulsion drive — the last non-native piece — is
+now NATIVE in the engine** (per-cell `Body::director` + rotational diffusion in
+`MeshSolver::preStepStart` + a per-vertex active force `v0·⟨incident directors⟩` in `VertexForce`,
+set via `MeshSolver.set_motility`). The faithful RNR + active cell-sorting capability now runs
+entirely inside TissueForge; the Python `add_noise_active` injection is retired to a comparison
+fallback. Broader standalone C++ port hardening and growth remain **later**.
 
 - **The finding that closed it:** the 3DVertVor/Manning oracle drives vertices by **active
   self-propulsion** (`x += dt·motility`, per-step ≈ 0.1·Lth), **not** thermal Brownian noise
   (√dt ≈ 14–45× Lth, which starves the reconnect trigger). Our harness had substituted thermal
   `tf.Force.random`; the faithful active model removed the last "noise-clamp" departure. Full
   reasoning: `rnr/PORTING_NOTES.md` §6n + memory `active-motility-not-thermal-noise`.
-- **Run it:** `pixi run test` (47-test gate) · `probe-active` (clamp-free rate) · `sort-oracle`
-  (one sort, `NOISE_MODEL=active` default) · `overnight` (full ensemble + figs + video) ·
-  `dpmax`/`fig1e`/`fig1f` (`MODEL=active`). Deliverables in `rnr/exports/`:
-  `fig1e_demixing_active.png`, `fig1f_stability_active.png`, `sort_active_demixing.gif`.
+- **Native drive (§6o):** `MeshSolver.set_motility(v0, Dr, seed)` enables it; `body.director` reads
+  the per-cell director. The seam: the vertex integrator is overdamped with unit mass (μ=1), so a
+  per-vertex force `v0·⟨n⟩` gives displacement `dt·v0·⟨n⟩` = the oracle's `dt·motility` exactly.
+  Validate: `pixi run python rnr/scripts/probe_native_calibration.py` (displacement/μ + Dr).
+- **Run it:** `pixi run test` (49-test gate) · `probe-active … native` (clamp-free native rate) ·
+  `sort-oracle` (one sort, `NOISE_MODEL=native` default; `active`=Python comparison) · `overnight`
+  (full ensemble + figs + video) · `dpmax`/`fig1e`/`fig1f` (`MODEL=active`). Deliverables in
+  `rnr/exports/`: `fig1e_demixing_active.png`, `fig1f_stability_active.png`, `sort_active_demixing.gif`.
+  (Remaining polish: regenerate canonical fig1e/1f with the native drive — point `run_overnight.py`
+  at `native` + a `MODEL=native` fig selector; `overnight` as written still uses `active`.)
 - **Engine:** fork `feat/native-rnr-reconnection` (native I↔H + periodic min-image geometry +
-  per-cell orientation repair). Build tree `tissue-forge_build/`.
+  per-cell orientation repair + **native active-motility drive**). Build tree `tissue-forge_build/`.
 - History lives in `PORTING_NOTES.md` (§6 = native port + noise finding) and the auto-memory;
   `docs/` keeps the findings notes. (Stale kickoff/planning prompts + the earlier-phase
   diagnostic scripts/tasks were pruned 2026-06-12.)

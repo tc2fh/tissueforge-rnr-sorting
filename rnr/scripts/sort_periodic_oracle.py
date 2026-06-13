@@ -59,15 +59,19 @@ NOISE_CLAMP = float(sys.argv[10]) if len(sys.argv) > 10 else 0.4
 # Initial condition for MODE=sort: "mixed" (random 50/50, Fig 1E) or "demixed" (a segregated
 # z-slab = the DP_max config; Fig 1F energetic-preference test -- does it STAY demixed?).
 IC = sys.argv[11] if len(sys.argv) > 11 else "mixed"
-# Noise model. "active" (DEFAULT, FAITHFUL): the 3DVertVor/Manning fork's ACTIVE self-propulsion
+# Noise model. "active" (FAITHFUL, Python comparison path): the 3DVertVor/Manning fork's ACTIVE self-propulsion
 # (Run.cpp:1345 `x += dt*motility`, motility = temperature*<cell director>, directors rotate with
 # rotational diffusion Dr=1). Per-step displacement ~ dt*V0 << Lth, so the instantaneous-edge
 # reconnect trigger catches collapses with NO clamp. "thermal": the old Euler-Maruyama sqrt(dt)
 # Brownian kick (the fork's thermal line Run.cpp:1344 is COMMENTED OUT) -- it is 14-45x Lth per
 # step and starves reconnection unless propped up by NOISE_CLAMP (the departure this replaces).
 # See PORTING_NOTES §6n. Under "active", KT is reused as the active speed V0 and NOISE_CLAMP is
-# ignored (the model needs none).
-NOISE_MODEL = sys.argv[12] if len(sys.argv) > 12 else "active"
+# ignored (the model needs none). "native" (PORTING_NOTES §6o): the SAME active model, but run
+# inside the C++ engine (per-cell Body director + per-vertex active force in MeshSolver) via
+# MeshSolver.set_motility -- no Python per-step injection. native and active are statistically
+# equivalent (same seed -> matching demixing/reconnection rate); native is the DEFAULT/production
+# path (PORTING_NOTES §6o gate 6). Pass "active" for the Python-injection comparison, "thermal" legacy.
+NOISE_MODEL = sys.argv[12] if len(sys.argv) > 12 else "native"
 
 if MODE == "substrate":
     SIGMA = 0.0; KT = 0.0
@@ -82,7 +86,7 @@ A0 = S0 * V0 ** (2.0 / 3.0)        # = 5.6
 MU = 1.0
 DISP_STD = float(np.sqrt(2.0 * MU * KT * DT)) if (KT > 0 and NOISE_MODEL == "thermal") else 0.0
 # active-motility params (faithful default): V0 == temperature, director rotational diffusion Dr=1
-V0_ACT = KT if NOISE_MODEL == "active" else 0.0
+V0_ACT = KT if NOISE_MODEL in ("active", "native") else 0.0
 DR = 1.0
 ROT_STD = float(np.sqrt(2.0 * DR * DT))
 MAX_VOL_FAC = 4.0
@@ -152,6 +156,14 @@ if MODE != "substrate":
     q.collision_2d = False
     mesh.quality = q
     mesh.periodic_geometry = True
+
+# NATIVE active drive (PORTING_NOTES §6o): hand the active self-propulsion to the C++
+# engine -- a per-cell director (rotational diffusion Dr) + a per-vertex active force
+# v0*<incident-cell directors>, evaluated inside tf.step(). The Python add_noise_active
+# injection is then NOT used (noise_step() is a no-op below). One call, before the loop:
+# directors are seeded random-on-S^2 here and evolve in the engine each step.
+if NOISE_MODEL == "native" and V0_ACT > 0:
+    tfv.MeshSolver.set_motility(V0_ACT, DR, SEED + 2)
 
 
 def lam(i, j):
@@ -285,15 +297,19 @@ def add_noise_active():
 
 
 def noise_step():
+    if NOISE_MODEL == "native":
+        return  # the C++ engine drives motility inside tf.step() (PORTING_NOTES §6o)
     if NOISE_MODEL == "active":
         add_noise_active()
     else:
         add_noise()
 
 
-_noise_desc = (f"active(V0={V0_ACT:g}, per-step<= {DT * V0_ACT:.2e}={DT * V0_ACT / LTH:.3f}xLth, Dr={DR:g})"
-               if NOISE_MODEL == "active"
-               else f"thermal(disp_std={DISP_STD:.4g}, clamp={NOISE_CLAMP})")
+if NOISE_MODEL in ("active", "native"):
+    _noise_desc = (f"{NOISE_MODEL}(V0={V0_ACT:g}, per-step<= {DT * V0_ACT:.2e}="
+                   f"{DT * V0_ACT / LTH:.3f}xLth, Dr={DR:g})")
+else:
+    _noise_desc = f"thermal(disp_std={DISP_STD:.4g}, clamp={NOISE_CLAMP})"
 print(f"=== ORACLE-FAITHFUL PERIODIC {MODE}/{IC} | M={M} N={len(bodies)} L={L} V0={V0} "
       f"K_V={K_V} K_A={K_A} A0={A0:.2f} | sigma={SIGMA} kT={KT} noise={NOISE_MODEL}:{_noise_desc} "
       f"Lth={LTH} dt={DT} cutoff={CUT} INT={INTERVAL} "
