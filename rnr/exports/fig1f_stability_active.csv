@@ -1,0 +1,6 @@
+series,DP/DPmax_0,DP/DPmax_end,n_seeds
+demixed_s0.5,0.9283,0.91,3
+mixed_s0.5,-0.006577,-0.0009352,3
+demixed_s0.1,0.9283,0.889,3
+demixed_s0.2,0.9283,0.9002,3
+demixed_s0.5,0.9283,0.91,3

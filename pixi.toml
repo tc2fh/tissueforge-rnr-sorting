@@ -1,0 +1,107 @@
+[workspace]
+name = "rnr-tissue-forge"
+version = "0.1.0"
+description = "RNR (3D T1) reconnection prototype for TissueForge, targeting 3DVertVor-style heterotypic cell sorting"
+# FROM-SOURCE build: we no longer use the prebuilt `tissue-forge` conda channel.
+# TissueForge is compiled from ./tissue-forge into this env's prefix (see
+# tissue-forge_build_runbook.md). Only conda-forge is needed for the toolchain + deps.
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+# Python 3.11 = safe newest. TF source supports 3.9-3.13 (conda recipe matrix;
+# tissue-forge/CMakeLists.txt:263 caps at <3.14); 3.11 is also the last Python that
+# pyvoro-mmalahe 1.3.4 supports. To go to 3.12/3.13 see runbook section 5.
+python = "3.11.*"
+
+# NOTE: there is intentionally NO `tissue-forge` dependency here -- the engine is built
+# from source by the `build-tf` task and installed straight into this env's
+# site-packages. `pixi install` sets up the toolchain; `pixi run build-tf` builds TF.
+
+# --- Build toolchain (mirrors tissue-forge/package/conda/recipe/meta.yaml build:) ---
+cmake = ">=3.20.3,<3.31"
+ninja = "*"
+swig = ">=4"
+c-compiler = "*"          # -> clang_osx-arm64  (sets CC, SDK sysroot, deployment target)
+cxx-compiler = "*"        # -> clangxx_osx-arm64
+git = "*"
+
+# --- TF build + runtime libs (meta.yaml host:/run:). The assimp pin is load-bearing:
+#     assimp >5.3.1 changed API and breaks the TF build. ---
+numpy = "*"
+libxml2 = "*"
+# conda-forge SPLIT libxml2 at 2.14/2.15: the runtime is `libxml2-16` and the C
+# headers (include/libxml2/libxml/*.h) moved to this separate `-devel` output.
+# Without it, vendored libsbml's CMake fails at generate: LIBXML::LIBXML points at
+# a non-existent include/libxml2. (build_tissue_forge_osx.sh sets LIBXML_INCLUDE_DIR
+# to $CONDA_PREFIX/include/libxml2, which -devel provides.)
+libxml2-devel = "*"
+assimp = "<=5.3.1"
+nlohmann_json = "*"
+eigen = "*"
+glfw = "*"
+bzip2 = "*"
+
+# --- Analysis / testing ---
+scipy = "*"            # also the fallback Voronoi/Delaunay if pyvoro won't build
+matplotlib = "*"
+pytest = "*"
+ffmpeg = "*"           # optional video encoding; video_periodic_active.py stitches a Pillow .gif
+                       # so this is not strictly required
+
+[pypi-dependencies]
+# pyvoro is PIP-ONLY. The maintained fork `pyvoro-mmalahe` builds from sdist on
+# osx-arm64 (no wheel exists for any Python here); it's fine on 3.11. If it breaks
+# `pixi install`, comment it out and use the scipy Voronoi/Delaunay fallback (CLAUDE.md
+# Phase 0); for 3.12/3.13 see runbook section 5.
+pyvoro-mmalahe = "*"
+
+[tasks]
+# Run everything through these so the env is always the pixi one. `pixi run <task>`.
+
+# THE BUILD: compile TissueForge (the fork with native I<->H reconnection + periodic geometry +
+# orientation repair) from ./tissue-forge into this env's prefix. Long (tens of min) the first
+# time; an incremental relink after that. Re-run after any C++/source edit. Build tree:
+# ./tissue-forge_build.
+build-tf = { cmd = "bash build_tissue_forge_osx.sh" }
+
+# Verify the engine imports and both solvers init (headless) -- the gate after build-tf.
+verify = { cmd = "python -c \"import tissue_forge as tf; tf.init(); from tissue_forge.models.vertex import solver as tfv; tfv.init(); print('TissueForge + vertex solver OK')\"" }
+
+# THE TEST GATE: round-trip reversibility + Condition-4 vetoes + periodic dynamics + the clamp-free
+# active-motility reconnection-rate test (47 tests).
+test = { cmd = "pytest rnr/tests -v" }
+
+# --- Faithful active-motility cell-sorting pipeline (the current science; PORTING_NOTES §6n) ---
+# The 3DVertVor/Manning oracle drives vertices by ACTIVE self-propulsion (x += dt*motility,
+# sub-Lth/step), NOT thermal Brownian noise (sqrt(dt) = 14-45x Lth, which starves the Lth reconnect
+# trigger and forced the old §6j clamp). The pipeline below reproduces Manning2024 Fig 1E/1F with
+# NO clamp.
+
+# Clamp-free reconnection-RATE probe (gates the faithful model): active no-clamp ~35/3000 (M=4
+# sigma=0.5) = the clamped-thermal rate, vs ~1 for unclamped thermal.
+# Args: [STEPS SIGMA V0 LTH DT CUT DR M SEED INTERVAL] (defaults 3000 0.5 0.1 1e-3 1e-3 1.9 1.0 4 7 10).
+probe-active = { cmd = "python rnr/scripts/probe_active_motility.py" }
+
+# One periodic two-type sort -> rnr/exports/sort_oracle_*_active[_demixed].csv. NOISE_MODEL defaults
+# to "active" (clamp-free); "thermal" = legacy clamp path + legacy CSV name.
+# Args: [MODE M SIGMA KT LTH DT CUT NSTEPS SEED CLAMP IC NOISE_MODEL].
+sort-oracle = { cmd = "python rnr/scripts/sort_periodic_oracle.py" }
+
+# Demixing VIDEO of the active sort -> rnr/exports/sort_active_demixing.gif (Pillow, no ffmpeg
+# needed). Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY] (defaults 40000 0.5 0.1 6 7 800).
+video = { cmd = "python rnr/scripts/video_periodic_active.py" }
+
+# FULL ensemble + video + figures: 18 sims (sigma x seed x mixed/demixed, 100k steps) with a
+# bounded-concurrency, failure-tolerant pool, then fig1e/fig1f. Background-friendly.
+# Args: [MAXPAR NSTEPS] (defaults 3 100000).
+overnight = { cmd = "python rnr/scripts/run_overnight.py" }
+
+# Fig 1E / 1F (Manning2024) from the active CSVs. DP = -demixing_index (Sahu Eq.2; re-derived).
+# Compute DP_max first, then plot. fig1e/fig1f take [M DT MODEL]; MODEL defaults to "active".
+dpmax = { cmd = "python rnr/scripts/compute_dpmax.py" }
+fig1e = { cmd = "python rnr/scripts/fig1e_demixing.py" }
+fig1f = { cmd = "python rnr/scripts/fig1f_stability.py" }
+
+# Convenience: full check before committing.
+check = { depends-on = ["verify", "test"] }

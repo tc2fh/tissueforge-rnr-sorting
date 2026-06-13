@@ -1,0 +1,24 @@
+# pixi environment (~1.4G; reproducible from pixi.toml + pixi.lock)
+.pixi/
+
+# Nested repositories tracked SEPARATELY -- never vendored into this repo:
+#   tissue-forge/    = the engine FORK (its own git + remote tc2fh/tissue-forge)
+#   tvm/, 3DVertVor/ = GPL upstream oracles (read-only references; license boundary)
+tissue-forge/
+tvm/
+3DVertVor/
+
+# Derived / build artifacts (regenerable, large): engine CMake build tree + built oracle
+tissue-forge_build/
+oracle_run/
+
+# Third-party reference PDFs (kept locally; not committed/redistributed)
+reference_pdfs/
+
+# Tooling / OS junk
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.claude/
+.DS_Store
