@@ -20,5 +20,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .vscode/
-.claude/
+# Local Claude Code state stays ignored, EXCEPT project skills/commands, which are
+# version-controlled so they travel with the repo across machines (e.g. /handoff, /resume).
+.claude/*
+!.claude/skills/
+!.claude/commands/
 .DS_Store

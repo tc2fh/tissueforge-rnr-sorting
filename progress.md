@@ -1,7 +1,9 @@
 # RNR in TissueForge — Progress
 
 > Companion to `CLAUDE.md`. **Canonical technical record:** `rnr/PORTING_NOTES.md`; reasoning
-> index: the auto-memory under `.claude/.../memory/`. Last updated: **2026-06-12**.
+> index: the auto-memory under `.claude/.../memory/`; per-session logs: `docs/sessions/`.
+> Last updated: **2026-06-21** — engine now builds + 48-test gate green on **linux-64 (WSL2)**, not just
+> osx-arm64 (see `docs/sessions/2026-06-21-1220-linux64-build-migration.md`).
 
 ## Status — the Phase-2 goal is REPRODUCED ✅
 
@@ -32,7 +34,7 @@ Details: `rnr/PORTING_NOTES.md` §6n; memory `active-motility-not-thermal-noise`
 
 ## Pipeline (`pixi run <task>`)
 
-`test` (47-test gate) · `probe-active` (clamp-free rate gate) · `sort-oracle` (one sort → CSV) ·
+`test` (48-test gate) · `probe-active` (clamp-free rate gate) · `sort-oracle` (one sort → CSV) ·
 `overnight` (full 18-sim ensemble + figures + video, failure-tolerant) · `video` · `dpmax` ·
 `fig1e` · `fig1f` (`MODEL=active`) · `build-tf` / `verify` (engine build + smoke).
 
@@ -42,7 +44,7 @@ Deliverables in `rnr/exports/`: `fig1e_demixing_active.png`, `fig1f_stability_ac
 ## Layout
 
 - `rnr/` — modules (`topology`, `reconnect`, `conditions`, `operator`, `metrics`, `geometry`) +
-  `scripts/` (the 9-script faithful pipeline) + `tests/` (47 green) + `PORTING_NOTES.md`.
+  `scripts/` (the 9-script faithful pipeline) + `tests/` (48 green) + `PORTING_NOTES.md`.
 - `tissue-forge/` — engine fork; `tissue-forge_build/` — its CMake build tree.
 - `tvm/`, `3DVertVor/`, `oracle_run/` — GPL reference oracles (read / compare only; never copied).
 - `docs/` — findings notes; `reference_pdfs/` — Okuda 2013, Manning 2024, Zhang–Schwarz.

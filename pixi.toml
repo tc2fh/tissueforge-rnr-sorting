@@ -6,7 +6,7 @@ description = "RNR (3D T1) reconnection prototype for TissueForge, targeting 3DV
 # TissueForge is compiled from ./tissue-forge into this env's prefix (see
 # tissue-forge_build_runbook.md). Only conda-forge is needed for the toolchain + deps.
 channels = ["conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
 # Python 3.11 = safe newest. TF source supports 3.9-3.13 (conda recipe matrix;
@@ -49,6 +49,20 @@ pytest = "*"
 ffmpeg = "*"           # optional video encoding; video_periodic_active.py stitches a Pillow .gif
                        # so this is not strictly required
 
+# --- linux-64-only build deps ---------------------------------------------------
+# TissueForge's CMake does `find_package(OpenGL REQUIRED)` unconditionally
+# (tissue-forge/CMakeLists.txt:317). On macOS OpenGL is a system framework, so
+# osx-arm64 needs nothing. On linux the GLVND *runtime* libs arrive via glfw/cairo,
+# but the *-devel half* (unversioned .so symlinks + GL/*.h headers that FindOpenGL
+# resolves to OPENGL_opengl_LIBRARY / OPENGL_glx_LIBRARY / OPENGL_INCLUDE_DIR) is
+# missing. These are the conda-forge GLVND equivalents of the recipe's
+# cdt('mesa-libgl-devel')/cdt('mesa-libegl-devel') (package/conda/recipe/meta.yaml).
+[target.linux-64.dependencies]
+libgl-devel = "*"
+libopengl-devel = "*"
+libglx-devel = "*"
+libegl-devel = "*"
+
 [pypi-dependencies]
 # pyvoro is PIP-ONLY. The maintained fork `pyvoro-mmalahe` builds from sdist on
 # osx-arm64 (no wheel exists for any Python here); it's fine on 3.11. If it breaks
@@ -69,7 +83,9 @@ build-tf = { cmd = "bash build_tissue_forge_osx.sh" }
 verify = { cmd = "python -c \"import tissue_forge as tf; tf.init(); from tissue_forge.models.vertex import solver as tfv; tfv.init(); print('TissueForge + vertex solver OK')\"" }
 
 # THE TEST GATE: round-trip reversibility + Condition-4 vetoes + periodic dynamics + the clamp-free
-# active-motility reconnection-rate test (47 tests).
+# active-motility reconnection-rate test (48 tests; a legacy thermal negative-control was
+# dropped on the linux-64 port -- it could not arm on the gcc/AVX trajectory, see
+# rnr/tests/test_periodic_dynamics.py).
 test = { cmd = "pytest rnr/tests -v" }
 
 # --- Faithful active-motility cell-sorting pipeline (the current science; PORTING_NOTES §6n) ---
@@ -105,3 +121,11 @@ fig1f = { cmd = "python rnr/scripts/fig1f_stability.py" }
 
 # Convenience: full check before committing.
 check = { depends-on = ["verify", "test"] }
+
+# --- Per-platform build override ------------------------------------------------
+# The default `build-tf` (above) calls the macOS script. On linux-64 (x86_64, gcc)
+# use the ported script, which drops the Apple-silicon / OSX-sysroot CMake flags and
+# leaves AVX/SSE4 at TF's defaults (ON) for SIMD speed. See
+# docs/MIGRATION_to_windows_wsl2.md §4. `pixi run build-tf` auto-selects by platform.
+[target.linux-64.tasks]
+build-tf = { cmd = "bash build_tissue_forge_linux.sh" }

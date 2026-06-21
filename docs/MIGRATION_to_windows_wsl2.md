@@ -53,13 +53,19 @@ You do **not** need to apt-install gcc/cmake/etc. — pixi pulls the conda toolc
 mkdir -p ~/Work/SegoLab && cd ~/Work/SegoLab
 git clone https://github.com/tc2fh/tissueforge-rnr-sorting.git VertexModeling
 cd VertexModeling
-git clone -b feat/native-rnr-reconnection https://github.com/tc2fh/tissue-forge.git
+git clone -b feat/native-rnr-reconnection --recurse-submodules https://github.com/tc2fh/tissue-forge.git
 git clone -b main                          https://github.com/ZhangTao-SJTU/tvm.git
 git clone -b 3DVertexForce                 https://github.com/Manning-Research-Group/3DVertVor.git
 ```
 
 Result: `tissue-forge/`, `tvm/`, `3DVertVor/` sit inside `VertexModeling/`, exactly as
 on the Mac.
+
+> **`--recurse-submodules` on the fork is load-bearing.** TissueForge vendors
+> Magnum / Corrade / magnum-plugins / libsbml as git submodules under `tissue-forge/extern/`;
+> without them CMake configure fails with `extern/<dep> does not contain a CMakeLists.txt`.
+> If you already cloned without it, recover with:
+> `git -C tissue-forge submodule update --init --recursive`.
 
 ---
 
@@ -79,7 +85,15 @@ pixi install        # re-solves pixi.lock for linux-64 and builds the toolchain 
 
 If `pyvoro-mmalahe` (pip sdist, in `[pypi-dependencies]`) fails to build, comment it out
 and rely on the scipy Voronoi/Delaunay fallback (CLAUDE.md, Phase 0) — it is only used
-for the initial packing.
+for the initial packing. (On this WSL2 box it built cleanly from sdist on 3.11, no fallback.)
+
+> **linux OpenGL build deps are already in `pixi.toml`** under `[target.linux-64.dependencies]`
+> (the GLVND `*-devel` packages `libgl-devel` / `libopengl-devel` / `libglx-devel` /
+> `libegl-devel`). TissueForge's CMake does `find_package(OpenGL REQUIRED)` unconditionally
+> (`CMakeLists.txt:317`); macOS gets OpenGL as a system framework, but on linux the GLVND
+> *runtime* libs arrive via glfw/cairo while the `-devel` half (the `.so` symlinks + `GL/*.h`
+> headers FindOpenGL needs) does not. `pixi install` pulls these automatically — no action
+> needed, just don't delete that table.
 
 ---
 
@@ -116,7 +130,7 @@ at — point it at the failing compile output.
 ## 5. Confirm the science reproduces, then run sweeps
 
 ```bash
-pixi run test            # 49-test gate (round-trip reversibility, Condition-4 vetoes,
+pixi run test            # 48-test gate (round-trip reversibility, Condition-4 vetoes,
                          # periodic dynamics, clamp-free active-motility rate, native motility)
 pixi run sort-oracle     # one periodic two-type sort (NOISE_MODEL=native default)
 pixi run overnight       # full ensemble + figs + video (background-friendly; the long sweep)
@@ -160,5 +174,6 @@ See `pixi.toml [tasks]` and `CLAUDE.md` "Current status" for the full task list
 - [ ] `linux-64` added to `pixi.toml` platforms; `pixi install` clean
 - [ ] `build_tissue_forge_linux.sh` authored; `pixi run build-tf` succeeds
 - [ ] `pixi run verify` prints "TissueForge + vertex solver OK"
-- [ ] `pixi run test` = 49 green
+- [ ] `pixi run test` = 48 green  (was 49 on osx-arm64; one legacy thermal negative-control
+      was dropped on the linux-64 port — it could not arm on the gcc/AVX trajectory)
 - [ ] `pixi run sort-oracle` produces a CSV in `rnr/exports/`

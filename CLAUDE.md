@@ -33,7 +33,7 @@ fallback. Broader standalone C++ port hardening and growth remain **later**.
   the per-cell director. The seam: the vertex integrator is overdamped with unit mass (μ=1), so a
   per-vertex force `v0·⟨n⟩` gives displacement `dt·v0·⟨n⟩` = the oracle's `dt·motility` exactly.
   Validate: `pixi run python rnr/scripts/probe_native_calibration.py` (displacement/μ + Dr).
-- **Run it:** `pixi run test` (49-test gate) · `probe-active … native` (clamp-free native rate) ·
+- **Run it:** `pixi run test` (48-test gate) · `probe-active … native` (clamp-free native rate) ·
   `sort-oracle` (one sort, `NOISE_MODEL=native` default; `active`=Python comparison) · `overnight`
   (full ensemble + figs + video) · `dpmax`/`fig1e`/`fig1f` (`MODEL=active`). Deliverables in
   `rnr/exports/`: `fig1e_demixing_active.png`, `fig1f_stability_active.png`, `sort_active_demixing.gif`.
