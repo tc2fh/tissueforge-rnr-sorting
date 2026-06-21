@@ -143,12 +143,13 @@ See `pixi.toml [tasks]` and `CLAUDE.md` "Current status" for the full task list
   history.
 - **VS Code:** from WSL run `code .` to open the workspace over the WSL remote; the Claude Code
   extension works there too.
-- **Curated auto-memory (optional):** the Mac's `~/.claude/projects/.../memory/` (MEMORY.md +
-  per-finding notes) lives **outside** this repo and was intentionally **not** published here.
-  CLAUDE.md already encapsulates the essential state. To carry the bonus memory over, copy those
-  files privately (USB / private gist / cloud drive) into the new machine's
-  `~/.claude/projects/<mangled-workspace-path>/memory/` after the first `claude` run creates that
-  folder. (The folder name is derived from the absolute workspace path, so it differs from the Mac's.)
+- **Curated auto-memory:** a snapshot of the Mac's `~/.claude/projects/.../memory/` (MEMORY.md +
+  per-finding notes) is committed in this repo at [`docs/project_memory/`](project_memory/), so it
+  travels with the clone. CLAUDE.md already encapsulates the essential state, but to re-activate the
+  full curated memory as *live* memory on the new machine, follow
+  [`docs/project_memory/README.md`](project_memory/README.md): run `claude` once to create
+  `~/.claude/projects/<mangled-new-path>/memory/`, then copy the snapshot files into it. (The folder
+  name is derived from the absolute workspace path, so it differs from the Mac's.)
 
 ---
 
