@@ -51,7 +51,10 @@ EXPORT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 FRAMES = os.path.join(EXPORT, "sort_active_frames")
 GIF = os.path.join(EXPORT, "sort_active_demixing.gif")
 
-tf.init(windowless=True, dim=[L, L, L], cutoff=CUT, dt=DT)
+# Honour TF_THREADS (the sweep pins 1 thread/job; TF threading gives ~0 speedup at this scale).
+_TFTHREADS = os.environ.get("TF_THREADS")
+_init_kw = {"threads": int(_TFTHREADS)} if _TFTHREADS else {}
+tf.init(windowless=True, dim=[L, L, L], cutoff=CUT, dt=DT, **_init_kw)
 tfv.init()
 mesh = tfv.MeshSolver.get().get_mesh()
 mesh.quality = None

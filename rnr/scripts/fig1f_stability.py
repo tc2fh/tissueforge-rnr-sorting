@@ -40,8 +40,9 @@ M = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 DT = sys.argv[2] if len(sys.argv) > 2 else "0.001"
 # noise model whose CSVs to plot: "active" (FAITHFUL clamp-free) default | "thermal" (legacy clamp).
 MODEL = sys.argv[3] if len(sys.argv) > 3 else "active"
-_SUF = r"_active" if MODEL == "active" else ""
-_NOISE_LBL = "active motility, clamp-free" if MODEL == "active" else "clamp=0.4 + native repair"
+_SUF = {"active": "_active", "native": "_native"}.get(MODEL, "")  # native = engine drive (…_native.csv)
+_NOISE_LBL = {"active": "active motility, clamp-free",
+              "native": "native engine motility, clamp-free"}.get(MODEL, "clamp=0.4 + native repair")
 COLORS = {0.1: "#e89bd0", 0.2: "#8d4bd6", 0.5: "#2e1378"}
 
 

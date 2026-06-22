@@ -97,7 +97,13 @@ tag = (f"oracle_M{M}_S{SIGMA:g}_KT{KT:g}_L{LTH:g}_dt{DT:g}_cut{CUT:g}_seed{SEED}
        + ("" if NOISE_MODEL == "thermal" else f"_{NOISE_MODEL}")  # thermal keeps the legacy name
        + ("" if IC == "mixed" else f"_{IC}"))
 
-tf.init(windowless=True, dim=[L, L, L], cutoff=CUT, dt=DT)
+# Engine thread pool. TissueForge defaults to ALL host cores (Simulator.threads=n_cpu); for a
+# parameter SWEEP of many small (M^3-cell) runs that oversubscribes badly, so honour a TF_THREADS
+# env override (the only working knob -- OMP_/TF_NUM_THREADS env vars are ignored by the engine;
+# tf.init(threads=) is). Unset -> engine default (single interactive run uses all cores).
+_TFTHREADS = os.environ.get("TF_THREADS")
+_init_kw = {"threads": int(_TFTHREADS)} if _TFTHREADS else {}
+tf.init(windowless=True, dim=[L, L, L], cutoff=CUT, dt=DT, **_init_kw)
 tfv.init()
 mesh = tfv.MeshSolver.get().get_mesh()
 mesh.quality = None

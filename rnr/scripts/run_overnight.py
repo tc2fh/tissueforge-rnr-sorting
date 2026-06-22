@@ -27,8 +27,21 @@ LOGDIR = os.path.join(EXPORTS, "overnight_logs")
 MASTER = os.path.join(EXPORTS, "overnight_run.log")
 PY = sys.executable
 
-MAXPAR = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+# THROUGHPUT (2026-06-21): TissueForge's engine spins a thread pool sized to ALL host cores by
+# default (Simulator.threads = n_cpu), but on these small M^3-cell vertex runs it shows ~0 parallel
+# scaling -- benchmarked 1 vs 16 threads = 32.6s vs 33.4s for 3000 steps (noise). So per-job threads
+# are wasted and only oversubscribe; throughput is maximised by 1 thread/job + many jobs at once.
+# We therefore pin TF_THREADS=1 per child (honoured by sort_periodic_oracle.py / video_*.py tf.init)
+# and run ALL sims concurrently. 18 sims + 1 video = 19 jobs <= 32 cores -> one wave (~18 min for
+# 100k steps), vs the old MAXPAR=3 / 32-thread-pool config's ~6 waves (~100 min). ~5-6x faster.
+MAXPAR = int(sys.argv[1]) if len(sys.argv) > 1 else 19
 NSTEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 100000
+# Active-drive model for the whole sweep + figures: "active" = Python add_noise_active (the prior
+# canonical figs); "native" = the C++ engine drive (MeshSolver.set_motility), ~3x faster and
+# statistically equivalent. native writes …_native[_demixed].csv and fig…_native.png so it never
+# clobbers the active set -- the two can be compared side by side (compare_active_native.py).
+MODEL = sys.argv[3] if len(sys.argv) > 3 else "active"
+TF_THREADS = os.environ.get("TF_THREADS", "1")   # 1 = throughput-optimal (no per-job scaling at M=6)
 M, DT, LTH, CUT = 6, "1e-3", "1e-3", "1.9"
 SIGMAS = [0.1, 0.2, 0.5]
 SEEDS = [7, 8, 9]
@@ -53,7 +66,7 @@ def mlog(msg):
 def oracle_cmd(sigma, seed, ic):
     # sort_periodic_oracle.py: MODE M SIGMA KT LTH DT CUT NSTEPS SEED CLAMP IC NOISE_MODEL
     return [PY, os.path.join(HERE, "sort_periodic_oracle.py"), "sort", str(M), str(sigma),
-            "0.1", LTH, DT, CUT, str(NSTEPS), str(seed), "0", ic, "active"]
+            "0.1", LTH, DT, CUT, str(NSTEPS), str(seed), "0", ic, MODEL]
 
 
 def video_cmd():
@@ -67,11 +80,14 @@ jobs = []
 for ic in ICS:
     for sigma in SIGMAS:
         for seed in SEEDS:
-            suff = "_active" + ("_demixed" if ic == "demixed" else "")
+            suff = f"_{MODEL}" + ("_demixed" if ic == "demixed" else "")
             csv = os.path.join(
                 EXPORTS, f"sort_oracle_M{M}_S{sigma:g}_KT0.1_L0.001_dt0.001_cut1.9_seed{seed}{suff}.csv")
             jobs.append((f"sim_S{sigma:g}_seed{seed}_{ic}", oracle_cmd(sigma, seed, ic), csv))
-jobs.append(("video_S0.5", video_cmd(), os.path.join(EXPORTS, "sort_active_demixing.gif")))
+# The demixing video is the Python-active illustration only; skip it for native (CSV comparison is
+# what proves equivalence, and the active run already produced sort_active_demixing.gif).
+if MODEL == "active":
+    jobs.append(("video_S0.5", video_cmd(), os.path.join(EXPORTS, "sort_active_demixing.gif")))
 
 
 def run_pool(joblist):
@@ -84,7 +100,8 @@ def run_pool(joblist):
             name, cmd, out = joblist[idx]; idx += 1
             fh = open(os.path.join(LOGDIR, f"{name}.log"), "w")
             mlog(f"START {name}")
-            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
+            child_env = {**os.environ, "TF_THREADS": TF_THREADS}   # 1 thread/job (throughput)
+            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, env=child_env)
             running.append((name, proc, fh, out))
         time.sleep(5)
         still = []
@@ -101,18 +118,18 @@ def run_pool(joblist):
     return results
 
 
-mlog(f"=== OVERNIGHT START: {len(jobs)} jobs (incl. video), MAXPAR={MAXPAR}, "
-     f"NSTEPS={NSTEPS}, M={M} ===")
+mlog(f"=== OVERNIGHT START [{MODEL}]: {len(jobs)} jobs, MAXPAR={MAXPAR}, "
+     f"TF_THREADS={TF_THREADS}/job, NSTEPS={NSTEPS}, M={M} ===")
 sim_results = run_pool(jobs)
 n_ok = sum(1 for _, ok, _ in sim_results if ok)
 mlog(f"=== PHASE 1 DONE: {n_ok}/{len(sim_results)} jobs OK ===")
 
 # ------- Phase 2: figures (tolerant; need the CSVs from phase 1) -------
 fig_jobs = [
-    ("fig1e_active", [PY, os.path.join(HERE, "fig1e_demixing.py"), str(M), "0.001", "active"],
-     os.path.join(EXPORTS, "fig1e_demixing_active.png")),
-    ("fig1f_active", [PY, os.path.join(HERE, "fig1f_stability.py"), str(M), "0.001", "active"],
-     os.path.join(EXPORTS, "fig1f_stability_active.png")),
+    (f"fig1e_{MODEL}", [PY, os.path.join(HERE, "fig1e_demixing.py"), str(M), "0.001", MODEL],
+     os.path.join(EXPORTS, f"fig1e_demixing_{MODEL}.png")),
+    (f"fig1f_{MODEL}", [PY, os.path.join(HERE, "fig1f_stability.py"), str(M), "0.001", MODEL],
+     os.path.join(EXPORTS, f"fig1f_stability_{MODEL}.png")),
 ]
 fig_results = run_pool(fig_jobs)
 
@@ -122,7 +139,10 @@ mlog("FINAL SUMMARY")
 for name, ok, rc in sim_results + fig_results:
     mlog(f"  {'OK  ' if ok else 'FAIL'}  {name}")
 mlog(f"Outputs in {EXPORTS}:")
-for f in ["fig1e_demixing_active.png", "fig1f_stability_active.png", "sort_active_demixing.gif"]:
+_outs = [f"fig1e_demixing_{MODEL}.png", f"fig1f_stability_{MODEL}.png"]
+if MODEL == "active":
+    _outs.append("sort_active_demixing.gif")
+for f in _outs:
     p = os.path.join(EXPORTS, f)
     mlog(f"  {'[ok] ' if os.path.exists(p) else '[--] '}{f}")
 mlog(f"=== OVERNIGHT DONE in {(time.time() - _t0) / 60:.1f} min ===")
