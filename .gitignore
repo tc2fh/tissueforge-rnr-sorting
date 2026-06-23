@@ -27,8 +27,11 @@ __pycache__/
 !.claude/commands/
 .DS_Store
 
-# Overnight-sweep process logs + intermediate video frames (artifacts, not deliverables;
+# Sweep/overnight process logs + intermediate video frames (artifacts, not deliverables;
 # the figures/CSVs/GIF they produce ARE tracked under rnr/exports/)
 rnr/exports/overnight_logs/
 rnr/exports/overnight_run*.log
+rnr/exports/sweep_logs/
+rnr/exports/sweep_run*.log
 rnr/exports/sort_active_frames/
+rnr/exports/vertex_motion_frames/

@@ -72,6 +72,12 @@ IC = sys.argv[11] if len(sys.argv) > 11 else "mixed"
 # equivalent (same seed -> matching demixing/reconnection rate); native is the DEFAULT/production
 # path (PORTING_NOTES §6o gate 6). Pass "active" for the Python-injection comparison, "thermal" legacy.
 NOISE_MODEL = sys.argv[12] if len(sys.argv) > 12 else "native"
+# reconnect_interval in STEPS (the native MeshQuality runs the reconnection pass every Nth step).
+# The oracle's faithful cadence is dtr = 10*dt (physical), i.e. interval = round(0.01/dt): 10 at
+# dt=1e-3 (the historical default, preserved), 2 at dt=5e-3, 1 at dt=1e-2. Exposed so a larger-dt
+# (cheaper) run can hold the SAME physical reconnection cadence -- see the dt-lever study (a bigger
+# dt is ~10x cheaper/step but under-catches reconnections, so we trade compute for fidelity).
+INTERVAL = int(sys.argv[13]) if len(sys.argv) > 13 else 10
 
 if MODE == "substrate":
     SIGMA = 0.0; KT = 0.0
@@ -90,7 +96,6 @@ V0_ACT = KT if NOISE_MODEL in ("active", "native") else 0.0
 DR = 1.0
 ROT_STD = float(np.sqrt(2.0 * DR * DT))
 MAX_VOL_FAC = 4.0
-INTERVAL = 10
 
 EXPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "exports")
 tag = (f"oracle_M{M}_S{SIGMA:g}_KT{KT:g}_L{LTH:g}_dt{DT:g}_cut{CUT:g}_seed{SEED}"
@@ -330,14 +335,31 @@ worst_max = 0.0
 rows = []
 
 
+# CSV written INCREMENTALLY (one row per checkpoint, flushed) so a long run that is killed or
+# power-cycled mid-way still leaves a usable partial curve -- and so demixing can be watched live
+# while a multi-hour run is in flight. The header is written once here; checkpoint() appends each
+# row. Final content is identical to the old bulk write, so downstream (fig1e/fig1f) is unaffected.
+csv_path = os.path.join(EXPORT_DIR, f"sort_{tag}.csv")
+_csv_fh = None
+if MODE == "sort":
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    _csv_fh = open(csv_path, "w")
+    _csv_fh.write("step,D,het_area,het_pairs,total_pairs,min_vol,max_vol,recon\n")
+    _csv_fh.flush()
+
+
 def checkpoint(step):
     global worst_min, worst_max
     s = contact_summary(bodies=bodies, lam=lam)
     vs = [b.volume for b in bodies]
     mn, mx = min(vs), max(vs)
     worst_min = min(worst_min, mn); worst_max = max(worst_max, mx)
-    rows.append((step, s["demixing_index"], s["het_area_fraction"], s["het_pairs"],
-                 s["total_pairs"], mn, mx, recon))
+    row = (step, s["demixing_index"], s["het_area_fraction"], s["het_pairs"],
+           s["total_pairs"], mn, mx, recon)
+    rows.append(row)
+    if _csv_fh is not None:
+        _csv_fh.write(",".join(f"{x:.6g}" for x in row) + "\n")
+        _csv_fh.flush()
     print(f"  step {step:6d}: D={s['demixing_index']:+.4f} hetA={s['het_area_fraction']:.4f} "
           f"het_pairs={s['het_pairs']}/{s['total_pairs']} min_vol={mn:.3f} max_vol={mx:.3f} "
           f"recon~{recon}", flush=True)
@@ -363,11 +385,6 @@ print(f"\nVERDICT [{tag}]: {'STABLE' if ok else 'UNSTABLE'} (worst_min={worst_mi
       f"worst_max={worst_max:.3f}) | D {D0:+.4f} -> {Dend:+.4f} | "
       f"hetA {rows[0][2]:.4f} -> {rows[-1][2]:.4f} | {recon} reconnections", flush=True)
 
-if MODE == "sort" and rows:
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    csv = os.path.join(EXPORT_DIR, f"sort_{tag}.csv")
-    with open(csv, "w") as fh:
-        fh.write("step,D,het_area,het_pairs,total_pairs,min_vol,max_vol,recon\n")
-        for r in rows:
-            fh.write(",".join(f"{x:.6g}" for x in r) + "\n")
-    print(f"wrote {csv}", flush=True)
+if _csv_fh is not None:
+    _csv_fh.close()
+    print(f"wrote {csv_path}", flush=True)

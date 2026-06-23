@@ -101,17 +101,36 @@ probe-active = { cmd = "python rnr/scripts/probe_active_motility.py" }
 
 # One periodic two-type sort -> rnr/exports/sort_oracle_*_active[_demixed].csv. NOISE_MODEL defaults
 # to "active" (clamp-free); "thermal" = legacy clamp path + legacy CSV name.
-# Args: [MODE M SIGMA KT LTH DT CUT NSTEPS SEED CLAMP IC NOISE_MODEL].
+# Args: [MODE M SIGMA KT LTH DT CUT NSTEPS SEED CLAMP IC NOISE_MODEL INTERVAL]. INTERVAL (steps
+# between reconnection passes) defaults to 10 = the oracle cadence dtr=10*dt at dt=1e-3; for a
+# larger dt pass round(0.01/dt) to hold that physical cadence (dt=5e-3 -> 2, dt=1e-2 -> 1).
 sort-oracle = { cmd = "python rnr/scripts/sort_periodic_oracle.py" }
 
 # Demixing VIDEO of the active sort -> rnr/exports/sort_active_demixing.gif (Pillow, no ffmpeg
 # needed). Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY] (defaults 40000 0.5 0.1 6 7 800).
 video = { cmd = "python rnr/scripts/video_periodic_active.py" }
 
+# WATCH the NATIVE sort demix LIVE in TissueForge's own 3D window (tf.run()). Needs a display
+# (WSLg on WSL2). Surfaces coloured by cell-type pair: gold = heterotypic interfaces (shrink as it
+# sorts). Args: [M SIGMA V0 SEED IC HET_ONLY] (defaults 6 0.5 0.1 7 mixed 0). Headless self-test:
+# WATCH_DRY=1 pixi run watch-native.
+watch-native = { cmd = "python rnr/scripts/watch_native_sort_window.py" }
+
+# VERTEX-MOTION GIF: every MESH VERTEX as a dot with a STABLE unique colour (fixed camera) so you can
+# track how individual vertices move + reconnect. -> rnr/exports/vertex_motion_<MODEL>.gif.
+# Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY MODEL ROTATE] (defaults 40000 0.5 0.1 6 7 500 native 0).
+video-vertices = { cmd = "python rnr/scripts/video_native_vertices.py" }
+
 # FULL ensemble + video + figures: 18 sims (sigma x seed x mixed/demixed, 100k steps) with a
 # bounded-concurrency, failure-tolerant pool, then fig1e/fig1f. Background-friendly.
 # Args: [MAXPAR NSTEPS] (defaults 3 100000).
 overnight = { cmd = "python rnr/scripts/run_overnight.py" }
+
+# LARGER-SCALE Fig 1E/1F sweep at a chosen M (does count-DP resolve as N,t grow toward the paper?).
+# 18 sims (sigma x seed x mixed/demixed) at NATIVE engine motility, staggered to bound the Voronoi-
+# build memory spike, then DP_max + fig1e/fig1f, M-tagged so M=6 and M=8 figures coexist.
+# Args: [NSTEPS M MAXPAR STAGGER MODEL] (defaults 2000000 8 18 12 native -> N=512, t=2000). Background.
+sweep = { cmd = "python rnr/scripts/run_sweep.py" }
 
 # Fig 1E / 1F (Manning2024) from the active CSVs. DP = -demixing_index (Sahu Eq.2; re-derived).
 # Compute DP_max first, then plot. fig1e/fig1f take [M DT MODEL]; MODEL defaults to "active".
