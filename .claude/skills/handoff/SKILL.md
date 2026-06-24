@@ -22,6 +22,12 @@ Write a session handoff to the repo's living docs. Terse, scannable, bullets ove
    the deliberate exception to "commit only when asked"). Rules:
    - Run the gate first (`pixi run test`) and **only commit if green**; state the result in the message
      (e.g. `tests: 81 passed`). If you can't run it, say so in the message rather than implying green.
+     - **Skip the re-run if the gate already passed green earlier THIS session AND only
+       non-test-affecting files changed since** (docs / `*.md` / memory — NOT `*.py`, `conftest`,
+       `pixi.toml`/`pyproject.toml`, or test data). Verify with `git diff --name-only` against the
+       working-tree state at that green run. Then state the prior result + the basis instead of
+       re-running (e.g. `tests: 108 passed earlier this session; only docs changed since`). If
+       unsure whether a change affects the tests, re-run.
    - **Stage selectively** — `git add` the specific files this session created/modified (incl. the new
      handoff + any `progress.md`/`CLAUDE.md` edits). **Never `git add -A`/`git add .`**: do NOT commit
      the read-only oracle repos (`tvm/`, `3DVertVor/`, `tissue-forge/`, `cellGPU/`, `VertAX/`,
