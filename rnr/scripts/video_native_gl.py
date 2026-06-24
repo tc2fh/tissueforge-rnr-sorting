@@ -21,10 +21,26 @@ Run:
   Env:
     HET_ONLY=1   draw ONLY the gold A|B interfaces (homotypic faces hidden) -- see the interior
                  interface shrink as it sorts, not just the outer shell.
+    CLIP=z       FIXED clip plane: keep only the half the normal points toward, so you see a
+                 cross-section through the tissue. <sign?><axis>: x y z +x -z ... (sign = kept
+                 side). CLIP_AT=0.5 sets the plane position as a box fraction. This is TF's OWN
+                 GL clip plane (vertex MeshRenderer Patch A), applied at tf.init -- see clip note.
     FPS=20       output frame rate.
-    VIEW=front   camera preset: front | top | right | back | left | bottom.
+    VIEW=front   camera preset (used only when the turntable is OFF): front | top | right | ...
+    ROTATE=auto  turntable that orbits the camera so the clip cut stays in view from every side.
+                 `auto` = ON whenever CLIP is set; set 1/0 to force. ELEV=-52 (camera pitch, deg;
+                 NEGATIVE looks DOWN into a top cut -- pair with CLIP=-z), AZIM=20 start yaw,
+                 AZIM_STEP=4 yaw advance per captured frame.
 Output: rnr/exports/native_gl_frames/frame_#####.png  +  rnr/exports/native_gl_sort_<MODEL>_<IC>.mp4
-        (falls back to a .gif if ffmpeg is unavailable).
+        (falls back to a .gif if ffmpeg is unavailable). When CLIP is set the basename gains a
+        `_clip<spec>` tag so clipped and full renders don't overwrite each other.
+
+CLIP-PLANE NOTE (debugged 2026-06-24): TF's native clip plane DOES work in the headless
+screenshot path (both `tf.init(clip_planes=...)` and the runtime `tf.rendering.ClipPlanes` API).
+`tf.init`'s parser is strict and SILENTLY drops a malformed entry: each plane must be a
+`(point, normal)` *tuple* whose point and normal are *lists* of 3 floats (not tuples, not numpy
+arrays) -- `rnr.clip.parse_clip_env` returns exactly that shape. `ClipPlanes.len()==0` after init
+means the entry was dropped. The kept half is the side the normal points toward.
 """
 import glob
 import os
@@ -39,6 +55,8 @@ import tissue_forge as tf  # noqa: E402
 from tissue_forge import rendering as R  # noqa: E402
 from tissue_forge.models.vertex import solver as tfv  # noqa: E402
 from tissue_forge.models.vertex.solver.mesh_types import BodyTypeSpec, SurfaceTypeSpec  # noqa: E402
+
+from rnr.clip import parse_clip_env  # noqa: E402  (pure numpy/os; safe to import before tf.init)
 
 N_STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 SIGMA = float(sys.argv[2]) if len(sys.argv) > 2 else 0.5
@@ -55,6 +73,12 @@ CUT = float(sys.argv[11]) if len(sys.argv) > 11 else 1.9
 HET_ONLY = os.environ.get("HET_ONLY", "0") in ("1", "true", "True")
 FPS = int(os.environ.get("FPS", "20"))
 VIEW = os.environ.get("VIEW", "front").lower()
+# Turntable (orbit the camera so you can see INTO the clip cut). Defaults ON whenever a
+# clip plane is active -- a fixed view of a cut only shows the cross-section from one side.
+ROTATE = os.environ.get("ROTATE", "auto").lower()
+ELEV = float(os.environ.get("ELEV", "-52"))      # camera pitch, deg. NEGATIVE = look DOWN (into a top cut)
+AZIM = float(os.environ.get("AZIM", "20"))       # starting yaw, deg
+AZIM_STEP = float(os.environ.get("AZIM_STEP", "4"))  # yaw advance per captured frame
 
 L = float(M)
 BOX = [[0.0, L]] * 3
@@ -63,12 +87,23 @@ DR = 1.0
 ROT_STD = float(np.sqrt(2.0 * DR * DT))
 INTERVAL = 10
 
+_CLIP_SPEC = os.environ.get("CLIP", "").strip().lower()
+CLIP = parse_clip_env(L)                        # (point, normal) lists or None -- fixed TF clip plane
+_CLIP_TAG = ("_clip" + _CLIP_SPEC.replace("+", "p").replace("-", "m")) if CLIP is not None else ""
+DO_ROTATE = (CLIP is not None) if ROTATE == "auto" else (ROTATE in ("1", "true", "yes", "on"))
+
 EXPORT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "exports")
-FRAMES = os.path.join(EXPORT, "native_gl_frames")
-OUT_BASE = os.path.join(EXPORT, f"native_gl_sort_{MODEL}_{IC}{'_het' if HET_ONLY else ''}")
+# Tag the frames dir too (not just the mp4) so a clipped render never clobbers a
+# concurrent un-clipped one -- each (clip) variant gets its own scratch dir.
+FRAMES = os.path.join(EXPORT, "native_gl_frames" + _CLIP_TAG)
+OUT_BASE = os.path.join(EXPORT, f"native_gl_sort_{MODEL}_{IC}{'_het' if HET_ONLY else ''}{_CLIP_TAG}")
 
 _TFTHREADS = os.environ.get("TF_THREADS")
 _init_kw = {"threads": int(_TFTHREADS)} if _TFTHREADS else {}
+if CLIP is not None:
+    # Strict TF format: a list of (point, normal) TUPLES whose entries are LISTS of 3 floats.
+    # parse_clip_env already returns plain lists; a malformed entry would be silently dropped.
+    _init_kw["clip_planes"] = [(CLIP[0], CLIP[1])]
 tf.init(windowless=True, dim=[L, L, L], cutoff=CUT, dt=DT, **_init_kw)
 tfv.init()
 mesh = tfv.MeshSolver.get().get_mesh()
@@ -198,10 +233,23 @@ _VIEWS = {
 frame_idx = 0
 
 
+def aim_camera():
+    """Point the camera. With the turntable on, orbit the yaw each captured frame at a
+    fixed downward pitch so the clip cross-section stays in view from every side -- a
+    fixed preset would only ever show the cut from one angle. camera_rotate_to_euler_angle
+    takes (pitch, yaw, roll) in RADIANS (probed 2026-06-24); pitch<0 looks down."""
+    if DO_ROTATE:
+        yaw = AZIM + frame_idx * AZIM_STEP
+        tf.system.camera_rotate_to_euler_angle(
+            tf.FVector3(float(np.radians(ELEV)), float(np.radians(yaw)), 0.0))
+    else:
+        _VIEWS.get(VIEW, tf.system.camera_view_front)()
+
+
 def capture(step, recon):
     global frame_idx
     recolor()
-    _VIEWS.get(VIEW, tf.system.camera_view_front)()
+    aim_camera()
     path = os.path.join(FRAMES, f"frame_{frame_idx:05d}.png")
     rc = tf.system.screenshot(path)
     ok = rc == 0 and os.path.exists(path) and os.path.getsize(path) > 0
@@ -242,9 +290,19 @@ if os.path.isdir(FRAMES):
     shutil.rmtree(FRAMES)
 os.makedirs(FRAMES, exist_ok=True)
 
+if CLIP is not None:
+    _nclip = R.ClipPlanes.len()
+    if _nclip == 0:
+        print("WARNING: CLIP set but TF registered 0 clip planes (entry dropped) -- "
+              "no clipping will be applied.", flush=True)
+    else:
+        print(f"clip plane: keep half with normal {CLIP[1]} through {CLIP[0]} "
+              f"(TF ClipPlanes.len()={_nclip})", flush=True)
+
+_cam = f"turntable e{ELEV:g} a{AZIM:g}+{AZIM_STEP:g}/f" if DO_ROTATE else f"view={VIEW}"
 print(f"=== NATIVE-GL SORT VIDEO [{MODEL}/{IC}]: N={len(bodies)} sigma={SIGMA} v0={V0_ACT} M={M} "
       f"steps={N_STEPS} | frame every {CAPTURE_EVERY} | {'HET-only' if HET_ONLY else 'all faces'} "
-      f"| view={VIEW} ===", flush=True)
+      f"| {_cam}{' | CLIP=' + _CLIP_SPEC if CLIP is not None else ''} ===", flush=True)
 capture(0, 0)
 recon = 0
 nv_prev = mesh.num_vertices

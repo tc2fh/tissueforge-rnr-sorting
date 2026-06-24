@@ -132,7 +132,7 @@ def main():
     ttl = "Paper's exact metric: count-based $DP/DP_{max}$ (Sahu Eq.2)"
     if dp_max:
         ttl += f"\n$DP_{{max}}$={dp_max:.3f} (finite-N ceiling; paper $\\to$1). Flat here:"
-    ttl += "\nneighbour-count sorting is reconnection/finite-N limited (N=216, t=100)"
+    ttl += f"\nneighbour-count sorting is reconnection/finite-N limited (N={M ** 3})"
     ax[0].set_title(ttl, fontsize=9)
     ax[0].legend(title="het. tension", fontsize=9, loc="lower left")
     ax[0].grid(alpha=0.3)

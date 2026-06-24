@@ -117,6 +117,15 @@ dependencies to the SWIG custom command. Ref: PORTING_NOTES §6, memory `tf-swig
 (a) Headless `tf.init(...)` hangs (≈0 CPU) without `windowless=True` (blocks creating a GL context).
 (b) `tf.init()` is a non-reentrant singleton — a 2nd call in one process hangs (forces subprocess-per-
 test). Arguably documented behaviour, but both are easy foot-guns worth a clear error instead of a hang.
+(c) **Camera getters read stale until the first render** (NOT a bug — a probe artifact worth recording).
+`camera_view_front/top/right/...` set the ArcBall's *target* transform (`ab->viewFront`), but
+`camera_rotation()`/`camera_center()` return the *current* transform (`ab->crotation()`), which only
+LERPs toward the target when the renderer updates the arcball during a draw. So reading the camera
+*before any* `screenshot()`/render returns the init default for every preset (looked like "presets do
+nothing"); reading *after* a screenshot returns correct, distinct values, and the presets DO render
+distinct images (verified: 6 axis-aligned presets → 6 different windowless screenshots, pairwise pixel
+diff 28–68). Practical rule: take/await one render before trusting camera getters. (`camera_disable_lagging`
+controls the LERP.) So `VIEW=top|right|...` in `video_native_gl.py` is fine.
 Ref: PORTING_NOTES §0.
 
 ---

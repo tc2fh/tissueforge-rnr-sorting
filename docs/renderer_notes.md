@@ -143,6 +143,43 @@ A companion single-cell proof — `rnr/scripts/kelvin_single_cell.py` →
 `rnr/exports/kelvin_single_cell.png` — builds ONE interior Kelvin cell directly (no destroy
 path) and renders it as a truncated octahedron: 6 square (blue) + 8 hexagon (orange) faces.
 
+## 3b. Clip planes — VERIFIED WORKING in the headless screenshot path (2026-06-24)
+
+Re-debugged because the videos "couldn't" show half the tissue. Conclusion: **the native
+clip plane is NOT broken** — Patch A (§1) made the vertex `MeshRenderer` honour it, and it
+clips correctly windowless via BOTH entry points. The earlier "it does nothing" reading was a
+**measurement artifact** (see the pixel-count caveat below), not a renderer bug.
+
+- **Init path:** `tf.init(clip_planes=[(point, normal), ...])`. The C++ parser
+  (`tfSimulatorPy.cpp::parse_kwargs`) is **strict and silent**: each entry must be a
+  `(point, normal)` **tuple** whose point and normal are **lists** of 3 floats. A tuple-of-tuples,
+  a list-of-lists, or numpy arrays for point/normal are **silently dropped** (it logs `LOG_ERROR`,
+  off by default) → `tf.rendering.ClipPlanes.len() == 0` and no clipping. `rnr.clip.parse_clip_env`
+  returns exactly the right `(list, list)` shape; the videos wrap it as `[(point, normal)]`.
+- **Runtime path:** `cp = tf.rendering.ClipPlanes.create(tf.FVector3(point), tf.FVector3(normal))`,
+  then `ClipPlanes.len()`, `cp.setEquation(point, normal)` (re-aim), `cp.destroy()`. All work
+  headless too (each makes the GL context current via the next `screenshot`).
+- **Kept half = the side the normal points toward** (`tfFlat3D.vert`:
+  `gl_ClipDistance = dot(instancePosition, planeEq) >= 0`, planeEq = `(normal, -dot(normal,point))`).
+  The shader's `instancePosition` is the raw world-space vertex (no `INSTANCED_TRANSFORMATION` on
+  the mesh shader), so the plane is defined directly in simulation coordinates `[0, L]`.
+- **Camera turntable** (to orbit and see INTO the cut, not just one side):
+  `tf.system.camera_rotate_to_euler_angle(FVector3(pitch, yaw, roll))` — angles in **RADIANS**;
+  `pitch < 0` looks DOWN (pair with a top cut, i.e. `CLIP=-z` keeping the lower half). Sweep `yaw`
+  per frame for the orbit. NOTE `tf.system.camera_rotation()` returns a stale/identical quaternion
+  across `camera_view_*` presets — do not use it to read back orientation.
+- **PIXEL-COUNT CAVEAT (this is what faked the bug):** TF's headless background is **mid-gray
+  (~128,128,128)**, not black. A naive "foreground = non-dark, saturated-ish" pixel count matches
+  ~99.9% of an 800×600 frame whether or not geometry is clipped, so it looked like nothing changed.
+  **Always eyeball the PNG** (or count against the actual gray bg / the box-wireframe-only frame).
+  This is the §2 "pixel-count the PNG" rule again — but the threshold itself must exclude the gray.
+
+Wiring: `video_native_gl.py` (real TF clip plane, init path) and `video_native_cells.py`
+(matplotlib per-face polygon clip, `rnr.clip.clip_polygon_halfspace`) both take `CLIP=<sign><axis>`
+(`z`,`-z`,`x`,...) + `CLIP_AT=<frac>`; the turntable auto-enables when `CLIP` is set. Clipped
+renders write to their OWN `native_*_frames_clip<spec>/` scratch dir + `_clip<spec>` mp4 so they
+never clobber a concurrent un-clipped run.
+
 ## 4. Git author note
 
 The fork's local commits initially used the hostname email; set to
