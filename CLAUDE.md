@@ -249,6 +249,12 @@ Verify the env with a one-liner: `import tissue_forge as tf; tf.init()` then
   Condition 1), say so explicitly in code comments and in PORTING_NOTES.md.
 - Cite the Okuda equation number in comments where a formula is implemented.
 - Don't claim a phase is done until its gate (test or metric) actually passes.
+- **Commit at handoff (standing authorization — overrides the default "commit only when
+  asked").** When running the `handoff` skill, commit the session's own tracked changes once
+  the gate (`pixi run test`) is green. Stage selectively (never `git add -A`): the read-only
+  oracle repos (`tvm/`, `3DVertVor/`, `tissue-forge/`, `cellGPU/`, `VertAX/`,
+  `gpu_reference_papers/`) carry their own `.git` and must never be committed. Branch off `main`
+  first if on it. **Pushing still requires an explicit ask** — commit is authorized, push is not.
 
 ## Citations to keep handy
 - TissueForge: Sego et al. (2023), *Sci. Rep.* 13:17886, “General, open-source vertex
