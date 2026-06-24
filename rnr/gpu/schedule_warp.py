@@ -23,17 +23,20 @@ The selection is deterministic (lowest-id-wins, not atomic-order-dependent), so 
 the host bit-for-bit -- unlike the eventual nondeterministic apply, which we validate by
 the order-invariant fingerprint instead.
 """
+import types
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 import warp as wp
 
+from .detect_warp import detect_short_edges_hybrid, detect_small_triangles_hybrid
 from .device_mesh import PaddedMesh
-from .reconnect_csr import ICfgIdx
-from .reconnect_warp import apply_i_to_h_batch_warp
-from .schedule_csr import i_to_h_veto_csr
-from .topology_csr import find_short_edges_csr
+from .gather_warp import detect_short_edges_device, detect_small_triangles_device
+from .reconnect_csr import HCfgIdx, ICfgIdx
+from .reconnect_warp import apply_h_to_i_batch_warp, apply_i_to_h_batch_warp
+from .schedule_csr import h_to_i_veto_csr, i_to_h_veto_csr
+from .topology_csr import find_short_edges_csr, find_small_triangles_csr
 
 wp.init()
 
@@ -41,6 +44,12 @@ wp.init()
 _FV = 8   # 2 end verts + 6 outer verts
 _FS = 9   # 3 side + 3 top + 3 bottom faces
 _FB = 5   # 2 caps + 3 side cells
+
+# the reverse [H]-neighbourhood footprint (the triangle + its 3 verts are EXISTING, so they
+# join the footprint; only the 2 recovered edge verts are fresh -- see schedule_csr.h_footprint)
+_HFV = 9   # 3 tri verts + 6 outer verts
+_HFS = 10  # the triangle + 3 side + 3 top + 3 bottom faces
+_HFB = 5   # 2 caps + 3 side cells
 
 
 # ======================================================================================
@@ -130,18 +139,122 @@ def reserve_independent_set_warp(pm: PaddedMesh, cands: List[Tuple[int, int, ICf
     return [cands[i] for i in range(len(cands)) if mask[i]]
 
 
+def reserve_independent_set_warp_g(g: dict, cands: List[Tuple[int, int, ICfgIdx]]
+                                   ) -> List[Tuple[int, int, ICfgIdx]]:
+    """reserve_independent_set_warp reading capacities (cap_v/cap_s/nb) straight from the device
+    SoA `g` instead of a host PaddedMesh -- for the fully-on-device sweep (no from_warp)."""
+    caps = types.SimpleNamespace(cap_v=g["cap_v"], cap_s=g["cap_s"], nb=g["nb"])
+    return reserve_independent_set_warp(caps, cands, device=g["device"])
+
+
+# ======================================================================================
+# C2': the reverse (H->I) reservation -- the same protocol with the H footprint sizes
+# ======================================================================================
+@wp.kernel
+def reserve_h_kernel(fp_v: wp.array2d(dtype=wp.int32), fp_s: wp.array2d(dtype=wp.int32),
+                     fp_b: wp.array2d(dtype=wp.int32),
+                     vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+                     bown: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    for k in range(_HFV):
+        wp.atomic_min(vown, fp_v[i, k], i)
+    for k in range(_HFS):
+        wp.atomic_min(sown, fp_s[i, k], i)
+    for k in range(_HFB):
+        wp.atomic_min(bown, fp_b[i, k], i)
+
+
+@wp.kernel
+def check_h_kernel(fp_v: wp.array2d(dtype=wp.int32), fp_s: wp.array2d(dtype=wp.int32),
+                   fp_b: wp.array2d(dtype=wp.int32),
+                   vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+                   bown: wp.array(dtype=wp.int32), won: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    w = wp.int32(1)
+    for k in range(_HFV):
+        if vown[fp_v[i, k]] != i:
+            w = wp.int32(0)
+    for k in range(_HFS):
+        if sown[fp_s[i, k]] != i:
+            w = wp.int32(0)
+    for k in range(_HFB):
+        if bown[fp_b[i, k]] != i:
+            w = wp.int32(0)
+    won[i] = w
+
+
+def pack_h_footprints(cands: List[Tuple[int, HCfgIdx]]):
+    """Pack H-candidate footprints into fixed-width (N,9)/(N,10)/(N,5) int32 arrays. Canonical
+    order: verts = 3 tri + (outer_top, outer_bot)*3 ; surfs = triangle + 3 side + 3 top + 3
+    bottom ; bodies = 2 caps + 3 side. Matches schedule_csr.h_footprint element-for-element."""
+    n = len(cands)
+    fpv = np.empty((n, _HFV), np.int32)
+    fps = np.empty((n, _HFS), np.int32)
+    fpb = np.empty((n, _HFB), np.int32)
+    for i, (_tri, cfg) in enumerate(cands):
+        fpv[i] = list(cfg.tri_verts) + [x for a in cfg.arms for x in (a.outer_top, a.outer_bot)]
+        fps[i] = ([cfg.triangle] + [a.side_surface for a in cfg.arms]
+                  + list(cfg.top_faces.values()) + list(cfg.bottom_faces.values()))
+        fpb[i] = [cfg.cap_top, cfg.cap_bot] + list(cfg.side_cells)
+    return fpv, fps, fpb
+
+
+def reserve_h_won_mask_warp(pm: PaddedMesh, cands: List[Tuple[int, HCfgIdx]],
+                            device=None) -> np.ndarray:
+    """One GPU reverse-reservation round; return the (N,) int32 won-mask. Mirror of
+    reserve_won_mask_warp with the H footprint sizes (must equal h_reserve_won_mask_host)."""
+    n = len(cands)
+    if n == 0:
+        return np.zeros(0, np.int32)
+    if device is None:
+        cuda = [d for d in wp.get_devices() if d.is_cuda]
+        device = cuda[0] if cuda else "cpu"
+    fpv, fps, fpb = pack_h_footprints(cands)
+    a2 = lambda a: wp.array(np.ascontiguousarray(a), dtype=wp.int32, device=device)
+    g_fpv, g_fps, g_fpb = a2(fpv), a2(fps), a2(fpb)
+    vown = wp.array(np.full(pm.cap_v, n, np.int32), dtype=wp.int32, device=device)
+    sown = wp.array(np.full(pm.cap_s, n, np.int32), dtype=wp.int32, device=device)
+    bown = wp.array(np.full(pm.nb, n, np.int32), dtype=wp.int32, device=device)
+    won = wp.zeros(n, dtype=wp.int32, device=device)
+    wp.launch(reserve_h_kernel, dim=n, device=device,
+              inputs=[g_fpv, g_fps, g_fpb, vown, sown, bown])
+    wp.launch(check_h_kernel, dim=n, device=device,
+              inputs=[g_fpv, g_fps, g_fpb, vown, sown, bown, won])
+    wp.synchronize_device(device)
+    return won.numpy()
+
+
+def reserve_h_independent_set_warp(pm: PaddedMesh, cands: List[Tuple[int, HCfgIdx]],
+                                   device=None) -> List[Tuple[int, HCfgIdx]]:
+    """The reverse candidates that won one GPU reservation round (a conflict-free batch)."""
+    mask = reserve_h_won_mask_warp(pm, cands, device)
+    return [cands[i] for i in range(len(cands)) if mask[i]]
+
+
+def reserve_h_independent_set_warp_g(g: dict, cands: List[Tuple[int, HCfgIdx]]
+                                     ) -> List[Tuple[int, HCfgIdx]]:
+    """reserve_h_independent_set_warp reading capacities from the device SoA `g` -- for the
+    fully-on-device reverse sweep (no from_warp)."""
+    caps = types.SimpleNamespace(cap_v=g["cap_v"], cap_s=g["cap_s"], nb=g["nb"])
+    return reserve_h_independent_set_warp(caps, cands, device=g["device"])
+
+
 # ======================================================================================
 # C2 glue: the iterated independent-set I->H sweep, run on the GPU
 # ======================================================================================
 def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = None,
-                         veto: bool = True, max_rounds: int = 64) -> Dict[str, object]:
+                         veto: bool = True, max_rounds: int = 64,
+                         gpu_scan: bool = False) -> Dict[str, object]:
     """The cellGPU iterated-batch loop assembled end-to-end on the device. Each round:
 
       1. DETECT  -- sync the device SoA back to a host PaddedMesh (PaddedMesh.from_warp,
                     slot-preserving) and scan it for short [I] edges + Condition-4 veto.
-                    Detection is still host-side -- the first cut per the plan; the on-GPU
-                    parallel-scan kernel is a later step. (The mesh always comes from `g`,
-                    so it reflects the surgery of all prior rounds.)
+                    With `gpu_scan=True` the O(mesh) scan runs on the GPU
+                    (detect_warp.detect_short_edges_hybrid: parallel trigger kernel + host
+                    gather on the few candidates) instead of the host Python scan
+                    find_short_edges_csr; the two produce the SAME sites in the SAME order, so
+                    it is a drop-in. (The mesh always comes from `g`, so it reflects the
+                    surgery of all prior rounds.)
       2. RESERVE -- the GPU atomic lowest-id-wins reservation (C2a) selects a conflict-free
                     batch from the candidates, on the device.
       3. APPLY   -- the GPU parallel count-changing surgery (C2b, apply_i_to_h_batch_warp)
@@ -174,7 +287,9 @@ def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = Non
     rounds = 0
     while rounds < max_rounds:
         pm = PaddedMesh.from_warp(g)                 # device -> host, slot-preserving
-        sites = find_short_edges_csr(pm, threshold)
+        sites = (detect_short_edges_hybrid(g, pm, threshold) if gpu_scan
+                 else find_short_edges_csr(pm, threshold))
+        sites.sort(key=lambda s: (s[0], s[1]))       # canonical order -> deterministic reservation
         if veto:
             sites = [s for s in sites if i_to_h_veto_csr(pm, s[2]) is None]
         if not sites:
@@ -183,6 +298,100 @@ def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = Non
         if not winners:                              # defensive: candidate 0 always wins
             break
         apply_i_to_h_batch_warp(g, winners, dl_th)
+        total += len(winners)
+        round_sizes.append(len(winners))
+        rounds += 1
+    return dict(total=total, rounds=rounds, round_sizes=round_sizes,
+                converged=(rounds < max_rounds))
+
+
+def reconnect_sweep_warp_device(g: dict, threshold: float, dl_th: Optional[float] = None,
+                                max_rounds: int = 64) -> Dict[str, object]:
+    """FULLY-ON-DEVICE forward I->H sweep: each round detects (GPU scan + GPU gather, with the
+    Condition-4 veto fused into the gather), reserves (C2a), and applies (C2b) -- with NO
+    PaddedMesh.from_warp(g). Only O(candidates) config data leaves the device per round (vs the
+    O(mesh) host copy + Python scan of reconnect_sweep_warp). There is no separate veto step (the
+    gather emits only legal configs). Same cascade/headroom caveats as reconnect_sweep_warp; like
+    it, round 1 matches the host-scan sweep by fingerprint, later rounds may pick a different (also
+    valid) batch as the device slot order diverges."""
+    if dl_th is None:
+        dl_th = threshold
+    total = 0
+    round_sizes: List[int] = []
+    rounds = 0
+    while rounds < max_rounds:
+        sites = detect_short_edges_device(g, threshold)   # scan + gather + fused veto, no from_warp
+        sites.sort(key=lambda s: (s[0], s[1]))            # canonical order -> deterministic reservation
+        if not sites:
+            break
+        winners = reserve_independent_set_warp_g(g, sites)
+        if not winners:
+            break
+        apply_i_to_h_batch_warp(g, winners, dl_th)
+        total += len(winners)
+        round_sizes.append(len(winners))
+        rounds += 1
+    return dict(total=total, rounds=rounds, round_sizes=round_sizes,
+                converged=(rounds < max_rounds))
+
+
+def reconnect_sweep_h_to_i_warp(g: dict, threshold: float, dl_th: Optional[float] = None,
+                                veto: bool = True, max_rounds: int = 64,
+                                gpu_scan: bool = False) -> Dict[str, object]:
+    """The reverse (H->I) mirror of reconnect_sweep_warp, assembled end-to-end on the device.
+    Each round: DETECT small triangles + Condition-4 veto -> RESERVE a conflict-free batch via
+    the GPU lowest-id-wins H-reservation (C2') -> APPLY every winner's H->I SIMULTANEOUSLY
+    (apply_h_to_i_batch_warp, mutating `g`) -> ITERATE. With `gpu_scan=True` the O(mesh) scan
+    runs on the GPU (detect_warp.detect_small_triangles_hybrid) instead of the host
+    find_small_triangles_csr -- a drop-in (same sites, same order). Same capacity/headroom +
+    per-round host-equivalence caveats as reconnect_sweep_warp (round 1 matches the host
+    reservation mirror reconnect_sweep_h_reserve_host bit/fingerprint; later for consistency)."""
+    if dl_th is None:
+        dl_th = threshold
+    dev = g["device"]
+    total = 0
+    round_sizes: List[int] = []
+    rounds = 0
+    while rounds < max_rounds:
+        pm = PaddedMesh.from_warp(g)                 # device -> host, slot-preserving
+        sites = (detect_small_triangles_hybrid(g, pm, threshold) if gpu_scan
+                 else find_small_triangles_csr(pm, threshold))
+        sites.sort(key=lambda s: s[0])               # canonical order -> deterministic reservation
+        if veto:
+            sites = [s for s in sites if h_to_i_veto_csr(pm, s[1]) is None]
+        if not sites:
+            break
+        winners = reserve_h_independent_set_warp(pm, sites, device=dev)
+        if not winners:                              # defensive: candidate 0 always wins
+            break
+        apply_h_to_i_batch_warp(g, winners, dl_th)
+        total += len(winners)
+        round_sizes.append(len(winners))
+        rounds += 1
+    return dict(total=total, rounds=rounds, round_sizes=round_sizes,
+                converged=(rounds < max_rounds))
+
+
+def reconnect_sweep_h_to_i_warp_device(g: dict, threshold: float, dl_th: Optional[float] = None,
+                                       max_rounds: int = 64) -> Dict[str, object]:
+    """FULLY-ON-DEVICE reverse H->I sweep (the mirror of reconnect_sweep_warp_device): each round
+    detects (GPU scan + GPU [H]-gather, Condition-4 veto fused), reserves (C2'), and applies
+    (h_to_i_batch_kernel) -- with NO PaddedMesh.from_warp(g). Only O(candidates) data leaves the
+    device per round. Same cascade/headroom caveats as reconnect_sweep_h_to_i_warp."""
+    if dl_th is None:
+        dl_th = threshold
+    total = 0
+    round_sizes: List[int] = []
+    rounds = 0
+    while rounds < max_rounds:
+        sites = detect_small_triangles_device(g, threshold)   # scan + gather + fused veto, no from_warp
+        sites.sort(key=lambda s: s[0])                        # canonical order -> deterministic reservation
+        if not sites:
+            break
+        winners = reserve_h_independent_set_warp_g(g, sites)
+        if not winners:
+            break
+        apply_h_to_i_batch_warp(g, winners, dl_th)
         total += len(winners)
         round_sizes.append(len(winners))
         rounds += 1

@@ -492,13 +492,99 @@ own CUDA runtime; mixing with TF's conda CUDA risks conflicts) — use a separat
       triangle (overlapping footprints), so a reverse sweep must schedule them as conflicts —
       reversing only the cap-cap sites re-expands the side-faces back to quads. This is the
       H→I analogue of the forward C1 cascade; production force-relaxation separates the scales.
-  - ▶ **next**: (a) finish the H→I scheduler — H-footprint (3 tri + 6 outer verts / triangle +
-    9 faces / 5 cells) + reservation (mirror C2a with the H sizes) + `h_to_i_batch_kernel`
-    (mirror `i_to_h_batch_kernel`) + a reverse sweep; round-trip gate as always; (b) on-GPU
-    detection (port the scans to parallel kernels so a sweep never returns to the host). Then
-    **Gate D** (stream-compaction of dead slots — the bump allocator's +3 verts/op makes this
-    needed for long runs), then **Gate E** (force + integration kernels + Fig 1E/1F sorting
-    validation vs the CPU oracle).
+  - ✅ **C1′+C2′ — the H→I scheduler (the reverse mirror of C1/C2a/C2b/C2c)** (2026-06-24):
+    the full reverse reconnection scheduler, host reference + GPU, with the round-trip gate.
+    - **Host C1′** (`rnr/gpu/schedule_csr.py`): `h_footprint` (the reverse footprint —
+      **9 verts** = 3 tri + 6 outer, **10 surfs** = the triangle + 3 side + 3 top + 3 bottom,
+      **5 bodies**; the triangle + its 3 verts ARE existing here, so they join the footprint —
+      that is what makes a cascade side-collapse triangle conflict with its parent cap-cap
+      triangle, serialising them), `h_to_i_veto_csr` (mirror `conditions.h_to_i_veto`:
+      caps share ≥2 faces / side-cell pair shares ≥2 faces / side-face pair shares ≥2 edges,
+      the last via a new index helper `faces_share_multiple_edges_csr` = "an edge IS a cyclic
+      vertex pair; ≥2 shared edges ⇒ veto"), `h_independent_set`, `h_reserve_won_mask_host`,
+      `h_reserve_independent_set_host`, `h_batch_is_conflict_free`, `h_apply_batch`, and both
+      sweeps (`reconnect_sweep_h_to_i` greedy + `reconnect_sweep_h_reserve_host` reservation,
+      the latter the per-round GPU mirror, exactly as on the I-side).
+    - **GPU C2′** (`rnr/gpu/reconnect_warp.py` + `schedule_warp.py`): `h_to_i_batch_kernel`
+      (the `h_to_i_kernel` body indexed per-candidate by `tid`; births bump `n_used[0]` by 2,
+      no surface alloc) + `apply_h_to_i_batch_warp`; `reserve_h_kernel`/`check_h_kernel` (the
+      C2a kernels with `_HFV=9,_HFS=10,_HFB=5`), `pack_h_footprints`, `reserve_h_won_mask_warp`,
+      `reserve_h_independent_set_warp`, and `reconnect_sweep_h_to_i_warp` (glued like C2c).
+    - **Gates** (`rnr/tests/test_gpu_schedule_h_csr.py` ×5, `test_gpu_schedule_h_warp.py` ×5):
+      host — h-independent-set conflict-free, veto fires on a double cap contact, reverse batch
+      order-independent + forward-then-reverse restores fp0, reverse sweep consistent, pure-[I]
+      no-op. GPU — H-reservation == host bit-for-bit (on the conflicting cap-cap+side-collapse
+      set), parallel `h_to_i` apply == host sequential (fingerprint, restores fp0), **a full
+      GPU round-trip: N parallel I→H then N parallel H→I restore the fingerprint**, GPU reverse
+      sweep round 1 == host reservation round 1. **43 GPU tests total, all green** (was 33).
+  - ✅ **On-GPU detection (the Condition-2 trigger scans)** (2026-06-24): `rnr/gpu/detect_warp.py`
+    — the O(mesh) per-round scan moved off the host Python loop onto parallel Warp kernels.
+    - **`scan_small_triangles_kernel`** (one thread / surface, single emit) + `scan_short_edges_kernel`
+      (one thread / vertex; each edge emitted by its SMALLER endpoint so NO cross-thread dedup —
+      only an O(k²) per-thread dedup of ring-neighbours + an O(k²) distinct-incident-body count,
+      both done inline with no per-thread scratch array). Atomic-append compaction.
+    - **Hybrid detect** (`detect_short_edges_hybrid`/`detect_small_triangles_hybrid`): GPU trigger
+      scan (O(mesh), on device) → host `i_/h_neighbourhood_csr` gather on just the few candidates
+      (O(cands)). A drop-in for `find_*_csr`: same sites, same canonical order.
+    - **Wired into the sweeps**: `reconnect_sweep_warp` / `reconnect_sweep_h_to_i_warp` take
+      `gpu_scan=False` (default = host Python scan, unchanged) / `True` (GPU scan). The host
+      `from_warp(g)` mirror still happens each round (needed for the gather + reservation packing),
+      so this removes the O(mesh) *Python* scan, not the device→host copy — the latter needs a full
+      device gather (the remaining step toward "never returns to the host").
+    - **Canonical-order fix (subtlety that mattered):** `find_short_edges_csr` returns sites in
+      Python SET-iteration order, but the lowest-id-wins reservation is order-SENSITIVE, so the
+      sorted GPU scan and the unsorted host scan picked DIFFERENT (both valid) winners → divergent
+      fingerprints (same round sizes, different topology). Fixed by sorting detected sites by a
+      canonical key ((v10,v11) / triangle idx) in ALL FOUR reservation sweeps (the 2 warp + their 2
+      host mirrors) — makes the schedule reproducible across host/GPU detection AND keeps the C2c
+      bit-for-bit round-1 gate exact (warp sweep and its host mirror both sort identically).
+    - **Gates** (`rnr/tests/test_gpu_detect_warp.py` ×6): GPU trigger set == host trigger ref
+      EXACTLY (both directions); hybrid detect == `find_*_csr` as a set AND in order, surgery-ready;
+      **`gpu_scan=True` sweep == `gpu_scan=False` sweep bit-for-bit** (same round sizes + fingerprint),
+      both directions. **49 GPU tests total, all green** (was 43).
+  - ✅ **Gate D — stream-compaction of dead slots** (2026-06-24): the bump allocator never reclaims
+    (+3 verts/+1 surf per I→H, +2 verts/−1 surf per H→I), so the high-water counters only grow.
+    Compaction renumbers LIVE elements into a contiguous prefix [0, n_live) (ascending old-slot
+    order) and resets the counters, keeping arrays bounded over long runs (cellGPU grow-then-compact).
+    - **Host** `PaddedMesh.compact()` (`rnr/gpu/device_mesh.py`): in-place, same capacity; remaps
+      s2v via vmap, v2s/b2s via smap, s2b (bodies) unchanged.
+    - **Device** `rnr/gpu/compact_warp.py`: `wp.utils.array_scan` (exclusive prefix-sum of the alive
+      flags → each live slot's new index) + scatter kernels into fresh arrays + an on-device n_used
+      set — NO O(mesh) host work; swaps the compacted arrays into `g` in place.
+    - **Gates** (`rnr/tests/test_gpu_compact.py` ×4): host compact preserves the fingerprint, drops
+      the counters to the live counts, idempotent; bounded over many forward+reverse+compact passes;
+      device compact == host compact (fingerprint + slot-for-slot); device compact after a device
+      round-trip restores the bounds.
+  - ✅ **Device GATHER — "never returns to the host" (both directions)** (2026-06-24): the
+    neighbourhood gather (the hardest kernel) + fused Condition-4 veto on the device, so a whole
+    round runs with NO `PaddedMesh.from_warp(g)` (only O(candidates) config data leaves the device).
+    `rnr/gpu/gather_warp.py`:
+    - **`gather_i_kernel`** = device `i_neighbourhood_csr` + `i_to_h_veto_csr`, FUSED: per candidate
+      edge it classifies v10's bodies (cap_top = body at v10 not v11; side cells = bodies at both),
+      finds cap_bot, the 3 arms (shared+consecutive+2-body side faces with their outer verts), the
+      3 top + 3 bottom faces, and applies the veto (caps mustn't touch; no triangular side face; no
+      side-cell pair sharing ≥2 faces). **No per-thread scratch** — results write straight to
+      per-candidate output rows; set ops are O(k²) over bounded adjacency.
+    - **`gather_h_kernel`** = the reverse mirror (device `h_neighbourhood_csr` + `h_to_i_veto_csr`):
+      per triangle, side cell per edge, side face per tri vert (interface of its two flank cells
+      containing it), outer verts by cap incidence, top/bottom faces, veto (caps share only the tri;
+      side-cell pairs one face; no two side faces share ≥2 edges via `d_faces_shared_edges`).
+    - **Fully-on-device sweeps**: `reconnect_sweep_warp_device` / `reconnect_sweep_h_to_i_warp_device`
+      (`schedule_warp.py`) — scan→gather(+veto)→reserve→apply with no `from_warp`; capacities read
+      from `g` via `reserve_*_independent_set_warp_g`.
+    - **Gates** (`rnr/tests/test_gpu_gather_warp.py` ×7): device gather == host gather+veto
+      per-candidate (caps/side cells/arms/top-bottom faces, normalised for free ordering), both
+      directions; device detection == hybrid-after-veto, surgery-ready; **a fully-device sweep round
+      == the host-scan sweep round by fingerprint**, both directions. (Round 1 is fingerprint-exact;
+      the device gather may order arms differently → permuted tri-vertex positions, same topology.)
+    - **Warp gotcha:** a cross-module `@wp.func` (here `d_vert_body_count` from `detect_warp`) MUST be
+      imported into the calling module's namespace or the kernel fails to compile with
+      "Referencing undefined symbol" (surfaced via `module.load(dev)`, not the bare pytest trace).
+  - **60 GPU tests total, all green** (was 49). ▶ **next**: **Gate E** (force/geometry/integration
+    kernels: volume + surface-area + tension gradients, overdamped step + active drive; wire a full
+    forward step and validate end-to-end Fig 1E/1F sorting STATISTICALLY vs the CPU oracle —
+    determinism stops mattering there). Optional perf: port the trigger scans' compaction to a device
+    prefix-sum so candidate indices never round-trip (currently O(cands) readback, not O(mesh)).
 
 **Risks to confront in this order:** (1) Warp on sm_120 actually initializes → verify *first*;
 (2) the parallel slot allocator + count-changing surgery (Gate B) — the real research risk;

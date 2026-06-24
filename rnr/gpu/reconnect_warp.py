@@ -589,6 +589,139 @@ def apply_i_to_h_batch_warp(g: dict, batch, dl_th: float):
 
 
 # ======================================================================================
+# C2': PARALLEL count-changing reverse apply -- dim=N winners each run H->I simultaneously
+# ======================================================================================
+@wp.kernel
+def h_to_i_batch_kernel(
+        vert_pos: wp.array(dtype=wp.vec3d), vert_alive: wp.array(dtype=wp.int32),
+        v2s: wp.array2d(dtype=wp.int32), v2s_len: wp.array(dtype=wp.int32),
+        surf_alive: wp.array(dtype=wp.int32),
+        s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
+        s2b: wp.array2d(dtype=wp.int32),
+        b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
+        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64,
+        c_triangle: wp.array(dtype=wp.int32),
+        c_cap_top: wp.array(dtype=wp.int32), c_cap_bot: wp.array(dtype=wp.int32),
+        c_tri_verts: wp.array2d(dtype=wp.int32),
+        c_arm_side: wp.array2d(dtype=wp.int32), c_arm_otop: wp.array2d(dtype=wp.int32),
+        c_arm_obot: wp.array2d(dtype=wp.int32),
+        c_top: wp.array2d(dtype=wp.int32), c_bot: wp.array2d(dtype=wp.int32),
+        out_nv: wp.array2d(dtype=wp.int32)):
+    """One thread per winning reverse candidate. H-footprints are disjoint (the reservation
+    guarantees it), so concurrent surgeries never touch a shared existing element; the 2
+    recovered edge verts use the shared atomic bump counter, so each thread gets distinct
+    fresh slots. This is the h_to_i_kernel body, indexed per-candidate by tid."""
+    i = wp.tid()
+    triangle = c_triangle[i]
+    cap_top = c_cap_top[i]
+    cap_bot = c_cap_bot[i]
+
+    # ---- placement (fp64) --------------------------------------------------------------
+    p0 = vert_pos[c_tri_verts[i, 0]]
+    p1 = vert_pos[c_tri_verts[i, 1]]
+    p2 = vert_pos[c_tri_verts[i, 2]]
+    r0 = (p0 + p1 + p2) / wp.float64(3.0)
+    nrm = safe_unit(wp.cross(p1 - p0, p2 - p0))
+    tm = (vert_pos[c_arm_otop[i, 0]] + vert_pos[c_arm_otop[i, 1]]
+          + vert_pos[c_arm_otop[i, 2]]) / wp.float64(3.0)
+    if wp.dot(tm - r0, nrm) < wp.float64(0.0):
+        nrm = -nrm
+    half = wp.float64(0.5) * dl_th
+
+    # ---- bump-allocate 2 edge verts (atomic; concurrent threads get distinct) ----------
+    v0 = wp.atomic_add(n_used, 0, 2)
+    nv10 = v0
+    nv11 = v0 + 1
+    vert_pos[nv10] = r0 + half * nrm
+    vert_pos[nv11] = r0 - half * nrm
+    vert_alive[nv10] = 1
+    v2s_len[nv10] = 0
+    vert_alive[nv11] = 1
+    v2s_len[nv11] = 0
+
+    # ---- (1) SIDE faces: [.., otop, tri_k, obot, ..] -> [.., otop, nv10, nv11, obot, ..] -
+    for k in range(3):
+        s = c_arm_side[i, k]
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, s, c_tri_verts[i, k], nv10)
+        d_insert_between(s2v, s2v_len, v2s, v2s_len, s, nv11, nv10, c_arm_obot[i, k])
+
+    # ---- (2) TOP faces: triangle edge -> single nv10 -----------------------------------
+    for t in range(3):
+        face = c_top[i, t]
+        first = wp.int32(-1)    # dynamic (mutated in the loop); Warp needs the typed init
+        second = wp.int32(-1)
+        L = s2v_len[face]
+        for jj in range(L):
+            x = s2v[face, jj]
+            if x == c_tri_verts[i, 0] or x == c_tri_verts[i, 1] or x == c_tri_verts[i, 2]:
+                if first < 0:
+                    first = x
+                elif second < 0:
+                    second = x
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, first, nv10)
+        d_drop_v(s2v, s2v_len, v2s, v2s_len, face, second)
+
+    # ---- (3) BOTTOM faces: mirror -> single nv11 ---------------------------------------
+    for t in range(3):
+        face = c_bot[i, t]
+        first = wp.int32(-1)    # dynamic (mutated in the loop); Warp needs the typed init
+        second = wp.int32(-1)
+        L = s2v_len[face]
+        for jj in range(L):
+            x = s2v[face, jj]
+            if x == c_tri_verts[i, 0] or x == c_tri_verts[i, 1] or x == c_tri_verts[i, 2]:
+                if first < 0:
+                    first = x
+                elif second < 0:
+                    second = x
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, first, nv11)
+        d_drop_v(s2v, s2v_len, v2s, v2s_len, face, second)
+
+    # ---- (4) detach + destroy the triangle and its orphaned vertices -------------------
+    d_detach_body(s2b, b2s, b2s_len, triangle, cap_top)
+    d_detach_body(s2b, b2s, b2s_len, triangle, cap_bot)
+    surf_alive[triangle] = 0
+    s2v_len[triangle] = 0
+    for k in range(3):
+        vert_alive[c_tri_verts[i, k]] = 0
+        v2s_len[c_tri_verts[i, k]] = 0
+
+    out_nv[i, 0] = nv10
+    out_nv[i, 1] = nv11
+
+
+def apply_h_to_i_batch_warp(g: dict, batch, dl_th: float):
+    """Apply a conflict-free batch of H->I on the device SoA `g`, ALL IN PARALLEL (dim=N).
+    `batch` is a list of (triangle_idx, HCfgIdx) (e.g. from the H reservation). Returns the
+    list of (nv10, nv11) recovered-edge slot pairs. Disjoint footprints => race-free."""
+    n = len(batch)
+    if n == 0:
+        return []
+    dev = g["device"]
+    cfgs = [b[1] for b in batch]
+    col = lambda fn: wp.array(np.array([fn(c) for c in cfgs], np.int32), dtype=wp.int32, device=dev)
+    mat = lambda fn: wp.array(np.array([fn(c) for c in cfgs], np.int32), dtype=wp.int32, device=dev)
+    c_triangle = col(lambda c: c.triangle)
+    c_cap_top = col(lambda c: c.cap_top)
+    c_cap_bot = col(lambda c: c.cap_bot)
+    c_tri_verts = mat(lambda c: list(c.tri_verts))
+    c_arm_side = mat(lambda c: [a.side_surface for a in c.arms])
+    c_arm_otop = mat(lambda c: [a.outer_top for a in c.arms])
+    c_arm_obot = mat(lambda c: [a.outer_bot for a in c.arms])
+    c_top = mat(lambda c: list(c.top_faces.values()))
+    c_bot = mat(lambda c: list(c.bottom_faces.values()))
+    out_nv = wp.zeros((n, 2), dtype=wp.int32, device=dev)
+    wp.launch(h_to_i_batch_kernel, dim=n, device=dev, inputs=[
+        g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
+        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th),
+        c_triangle, c_cap_top, c_cap_bot, c_tri_verts, c_arm_side, c_arm_otop, c_arm_obot,
+        c_top, c_bot, out_nv])
+    wp.synchronize_device(dev)
+    nv = out_nv.numpy()
+    return [(int(nv[i, 0]), int(nv[i, 1])) for i in range(n)]
+
+
+# ======================================================================================
 # precision probe (risk #2): fp32 vs fp64 placement on-device, vs the numpy fp64 oracle
 # ======================================================================================
 @wp.kernel

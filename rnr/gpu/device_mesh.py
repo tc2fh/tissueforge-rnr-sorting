@@ -156,6 +156,63 @@ class PaddedMesh:
             body_alive=np.ones(nb, bool),
         )
 
+    # ---------------------------------------------------------------- compaction ------
+    def compact(self) -> dict:
+        """Gate D (host reference): reclaim dead slots in place. Live vertices/surfaces are
+        renumbered into a contiguous prefix [0, n_live) in ASCENDING slot order (deterministic,
+        matches the device prefix-sum compaction); every reference is rewritten through the
+        remap; the high-water counters reset to the live counts so future bump-allocations
+        reuse the freed tail. Capacity (cap_v/cap_s/MAX_*) is unchanged.
+
+        Bodies are stable under I<->H (never freed), so body indices are untouched; only the
+        surface indices inside b2s are remapped. Assumes a consistent mesh (check_consistency
+        clean): live elements reference only live elements, so the remap never hits a dead slot.
+        Returns {'vfreed','sfreed'} -- the slot counts reclaimed. Topology (the body-anchored
+        fingerprint) is preserved; only slot labels change."""
+        vlive = np.where(self.vert_alive[:self.n_v_used] == 1)[0]
+        slive = np.where(self.surf_alive[:self.n_s_used] == 1)[0]
+        nv, ns = len(vlive), len(slive)
+        vmap = np.full(self.cap_v, -1, np.int64)
+        vmap[vlive] = np.arange(nv)
+        smap = np.full(self.cap_s, -1, np.int64)
+        smap[slive] = np.arange(ns)
+
+        vert_pos = np.zeros_like(self.vert_pos)
+        vert_alive = np.zeros_like(self.vert_alive)
+        v2s = np.full_like(self.v2s, -1)
+        v2s_len = np.zeros_like(self.v2s_len)
+        surf_alive = np.zeros_like(self.surf_alive)
+        s2v = np.full_like(self.s2v, -1)
+        s2v_len = np.zeros_like(self.s2v_len)
+        s2b = np.full_like(self.s2b, -1)
+        b2s = np.full_like(self.b2s, -1)
+        b2s_len = np.zeros_like(self.b2s_len)
+
+        for new, old in enumerate(vlive):
+            vert_pos[new] = self.vert_pos[old]
+            vert_alive[new] = 1
+            L = int(self.v2s_len[old])
+            v2s[new, :L] = smap[self.v2s[old, :L]]      # v2s holds SURFACE indices -> smap
+            v2s_len[new] = L
+        for new, old in enumerate(slive):
+            surf_alive[new] = 1
+            L = int(self.s2v_len[old])
+            s2v[new, :L] = vmap[self.s2v[old, :L]]       # s2v holds VERTEX indices -> vmap
+            s2v_len[new] = L
+            s2b[new] = self.s2b[old]                      # s2b holds BODY indices -> unchanged
+        for b in range(self.nb):
+            L = int(self.b2s_len[b])
+            b2s[b, :L] = smap[self.b2s[b, :L]]           # b2s holds SURFACE indices -> smap
+            b2s_len[b] = L
+
+        vfreed, sfreed = self.n_v_used - nv, self.n_s_used - ns
+        self.vert_pos, self.vert_alive = vert_pos, vert_alive
+        self.v2s, self.v2s_len = v2s, v2s_len
+        self.surf_alive, self.s2v, self.s2v_len, self.s2b = surf_alive, s2v, s2v_len, s2b
+        self.b2s, self.b2s_len = b2s, b2s_len
+        self.n_v_used, self.n_s_used = nv, ns
+        return dict(vfreed=int(vfreed), sfreed=int(sfreed))
+
     @staticmethod
     def from_warp(g: dict) -> "PaddedMesh":
         """Read a device SoA (as produced by to_warp, after kernels mutated it) back into
