@@ -12,12 +12,12 @@ It produces the SAME ICfgIdx that reconnect_csr.i_to_h_csr consumes, so detectio
 surgery needs no TF round-trip. All host numpy here (the reference semantics); the Gate-C2
 kernel will run the same predicate per candidate thread.
 """
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 from .device_mesh import PaddedMesh
-from .reconnect_csr import ArmIdx, ICfgIdx
+from .reconnect_csr import ArmIdx, HArmIdx, HCfgIdx, ICfgIdx
 
 
 # --------------------------------------------------------------------------------------
@@ -155,4 +155,110 @@ def find_short_edges_csr(pm: PaddedMesh, threshold: float
             cfg = i_neighbourhood_csr(pm, v, w)
             if cfg is not None:
                 out.append((v, w, cfg))
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# the H-neighbourhood (index world) -- mirror topology.h_neighbourhood (reverse direction)
+# --------------------------------------------------------------------------------------
+def _tri_edges(vids) -> List[Tuple[int, int]]:
+    """The 3 undirected edges of a triangle, as sorted (a, b) tuples."""
+    a, b, c = vids
+    return [tuple(sorted(e)) for e in ((a, b), (b, c), (c, a))]
+
+
+def h_neighbourhood_csr(pm: PaddedMesh, triangle: int) -> Optional[HCfgIdx]:
+    """Gather + validate the [H] neighbourhood of a triangular face `triangle` (surface
+    index), in PaddedMesh indices. Returns an HCfgIdx (ready for h_to_i_csr) or None.
+
+    Mirrors topology.h_neighbourhood condition-for-condition; the Condition-2 max-edge
+    trigger is applied by find_small_triangles_csr. The index-world reverse of
+    i_neighbourhood_csr -- like that detector it uses NO TF handles, so the scheduler can
+    re-detect [H] sites directly on the device-mutated mesh between batches."""
+    if not pm.surf_alive[triangle] or int(pm.s2v_len[triangle]) != 3:
+        return None
+    tri_vs = [int(x) for x in pm.s2v[triangle, :3]]
+    caps = [int(b) for b in pm.s2b[triangle] if b >= 0]
+    if len(caps) != 2:                                 # triangle shared by exactly 2 caps
+        return None
+    cap_top, cap_bot = caps[0], caps[1]
+    cap_ids = {cap_top, cap_bot}
+
+    if any(len(vert_bodies(pm, v)) != 4 for v in tri_vs):   # tri verts interior (4 cells)
+        return None
+
+    # side cell per triangle edge = the common cell of the edge's endpoints minus the caps.
+    edge_side_cell: Dict[Tuple[int, int], int] = {}
+    side_ids: Set[int] = set()
+    for e in _tri_edges(tri_vs):
+        a, b = e
+        rest = (vert_bodies(pm, a) & vert_bodies(pm, b)) - cap_ids
+        if len(rest) != 1:
+            return None
+        sc = next(iter(rest))
+        edge_side_cell[e] = sc
+        side_ids.add(sc)
+    if len(side_ids) != 3:
+        return None
+
+    # each triangle vertex sits in one SIDE face: the interface of the two side cells
+    # flanking it (the side cells of its two incident triangle edges), which contains v +
+    # its two outer vertices (one toward each cap).
+    arms: List[HArmIdx] = []
+    for v in tri_vs:
+        flank = [edge_side_cell[e] for e in _tri_edges(tri_vs) if v in e]
+        if len(flank) != 2:
+            return None
+        iface = find_interface(pm, flank[0], flank[1])
+        side_surf = next((s for s in iface
+                          if v in {int(x) for x in pm.s2v[s, :int(pm.s2v_len[s])]}), None)
+        if side_surf is None:
+            return None
+        prev, nxt = pm.ring_neighbors(side_surf, v)     # v's two outer vertices
+        outer_top = outer_bot = None
+        for w in (prev, nxt):
+            wb = vert_bodies(pm, w)
+            if cap_top in wb:
+                outer_top = w
+            elif cap_bot in wb:
+                outer_bot = w
+        if outer_top is None or outer_bot is None:
+            return None
+        arms.append(HArmIdx(tri_vertex=v, side_surface=side_surf,
+                            outer_top=outer_top, outer_bot=outer_bot))
+
+    # 3 top + 3 bottom faces (side<->cap interfaces), each a single surface (Cond-4 extra).
+    top_faces, bottom_faces = {}, {}
+    for sc in side_ids:
+        it = find_interface(pm, sc, cap_top)
+        ib = find_interface(pm, sc, cap_bot)
+        if len(it) != 1 or len(ib) != 1:
+            return None
+        top_faces[sc] = it[0]
+        bottom_faces[sc] = ib[0]
+
+    return HCfgIdx(triangle=triangle, tri_verts=[a.tri_vertex for a in arms],
+                   cap_top=cap_top, cap_bot=cap_bot, side_cells=sorted(side_ids),
+                   arms=arms, top_faces=top_faces, bottom_faces=bottom_faces)
+
+
+def find_small_triangles_csr(pm: PaddedMesh, threshold: float
+                             ) -> List[Tuple[int, HCfgIdx]]:
+    """All triangular faces whose MAX edge < threshold that form a valid [H] config, as
+    (triangle_idx, HCfgIdx) pairs. Mirrors topology.find_small_triangles: Condition 2 for
+    the reverse direction triggers on the MAX of the three triangle edges (NOT the min --
+    Honda's wrong 'condition H'; see CLAUDE.md). The H-analog of find_short_edges_csr; the
+    Condition-2 trigger scan the reverse scheduler iterates on."""
+    out = []
+    for s in range(pm.n_s_used):
+        if not pm.surf_alive[s] or int(pm.s2v_len[s]) != 3:
+            continue
+        cfg = h_neighbourhood_csr(pm, s)
+        if cfg is None:
+            continue
+        t = cfg.tri_verts
+        max_edge = max(edge_length(pm, t[0], t[1]), edge_length(pm, t[1], t[2]),
+                       edge_length(pm, t[2], t[0]))
+        if max_edge < threshold:
+            out.append((s, cfg))
     return out

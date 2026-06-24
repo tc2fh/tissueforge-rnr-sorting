@@ -23,7 +23,7 @@ The selection is deterministic (lowest-id-wins, not atomic-order-dependent), so 
 the host bit-for-bit -- unlike the eventual nondeterministic apply, which we validate by
 the order-invariant fingerprint instead.
 """
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -31,6 +31,9 @@ import warp as wp
 
 from .device_mesh import PaddedMesh
 from .reconnect_csr import ICfgIdx
+from .reconnect_warp import apply_i_to_h_batch_warp
+from .schedule_csr import i_to_h_veto_csr
+from .topology_csr import find_short_edges_csr
 
 wp.init()
 
@@ -125,3 +128,63 @@ def reserve_independent_set_warp(pm: PaddedMesh, cands: List[Tuple[int, int, ICf
     """The candidates that won one GPU reservation round (a conflict-free batch)."""
     mask = reserve_won_mask_warp(pm, cands, device)
     return [cands[i] for i in range(len(cands)) if mask[i]]
+
+
+# ======================================================================================
+# C2 glue: the iterated independent-set I->H sweep, run on the GPU
+# ======================================================================================
+def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = None,
+                         veto: bool = True, max_rounds: int = 64) -> Dict[str, object]:
+    """The cellGPU iterated-batch loop assembled end-to-end on the device. Each round:
+
+      1. DETECT  -- sync the device SoA back to a host PaddedMesh (PaddedMesh.from_warp,
+                    slot-preserving) and scan it for short [I] edges + Condition-4 veto.
+                    Detection is still host-side -- the first cut per the plan; the on-GPU
+                    parallel-scan kernel is a later step. (The mesh always comes from `g`,
+                    so it reflects the surgery of all prior rounds.)
+      2. RESERVE -- the GPU atomic lowest-id-wins reservation (C2a) selects a conflict-free
+                    batch from the candidates, on the device.
+      3. APPLY   -- the GPU parallel count-changing surgery (C2b, apply_i_to_h_batch_warp)
+                    runs every winner SIMULTANEOUSLY, mutating `g` in place.
+      4. ITERATE -- re-detect on the mutated mesh; stop when no legal short edge remains
+                    (or max_rounds).
+
+    `g` is a PaddedMesh.to_warp() dict, mutated in place. `dl_th` defaults to `threshold`;
+    `veto` toggles the Condition-4 filter. Returns a report (rounds, per-round batch sizes,
+    total reconnections), matching reconnect_sweep_reserve_host's shape.
+
+    CAPACITY: the bump allocator never reclaims (+3 verts / +1 surf per I->H), so `g` must
+    be sized with enough headroom for the WHOLE sweep -- Gate D (stream-compaction) lifts
+    this. CASCADE (C1 finding): a static-mesh sweep does NOT converge (an I->H seeds new
+    short edges among the triangle verts); production relaxes the mesh between steps, so
+    bound `max_rounds`.
+
+    EQUIVALENCE TO THE HOST (reconnect_sweep_reserve_host): round 1 starts from the same
+    slot layout as the host reference, so detection + reservation are identical (C2a is
+    bit-for-bit) and the parallel apply matches the host sequential apply by body-anchored
+    fingerprint (C2b). ACROSS rounds the device's atomic-bump slot order diverges from the
+    host's sequential order (same topology, different slot labels), so only the FIRST round
+    is bit/fingerprint-equal; later rounds are validated for consistency, like the C1 sweep.
+    """
+    if dl_th is None:
+        dl_th = threshold
+    dev = g["device"]
+    total = 0
+    round_sizes: List[int] = []
+    rounds = 0
+    while rounds < max_rounds:
+        pm = PaddedMesh.from_warp(g)                 # device -> host, slot-preserving
+        sites = find_short_edges_csr(pm, threshold)
+        if veto:
+            sites = [s for s in sites if i_to_h_veto_csr(pm, s[2]) is None]
+        if not sites:
+            break
+        winners = reserve_independent_set_warp(pm, sites, device=dev)
+        if not winners:                              # defensive: candidate 0 always wins
+            break
+        apply_i_to_h_batch_warp(g, winners, dl_th)
+        total += len(winners)
+        round_sizes.append(len(winners))
+        rounds += 1
+    return dict(total=total, rounds=rounds, round_sizes=round_sizes,
+                converged=(rounds < max_rounds))

@@ -121,6 +121,22 @@ def reserve_won_mask_host(cands: List[Tuple[int, int, ICfgIdx]]) -> List[int]:
     return mask
 
 
+def reserve_independent_set_host(cands: List[Tuple[int, int, ICfgIdx]]
+                                 ) -> List[Tuple[int, int, ICfgIdx]]:
+    """The winners of ONE host reservation round (lowest-id-wins) -- the host mirror of
+    schedule_warp.reserve_independent_set_warp.
+
+    NB this is ONE reservation round: conflict-free but NOT maximal. It can select strictly
+    fewer than the greedy `independent_set` -- a candidate loses if any of its footprint
+    elements is also wanted by a lower-id candidate, even one that itself loses elsewhere
+    (the classic A-B, B-C conflicting / A-C disjoint chain: greedy keeps {A,C}, one
+    reservation round keeps only {A}). The GPU reservation kernel reproduces THIS set
+    bit-for-bit (C2a), so it -- not greedy `independent_set` -- is the per-round selection
+    the GPU sweep matches."""
+    mask = reserve_won_mask_host(cands)
+    return [cands[i] for i in range(len(cands)) if mask[i]]
+
+
 def batch_is_conflict_free(batch: List[Tuple[int, int, ICfgIdx]]) -> bool:
     """True iff every pair of candidates in `batch` has disjoint footprints."""
     rv: Set[int] = set()
@@ -171,6 +187,36 @@ def reconnect_sweep_i_to_h(pm: PaddedMesh, threshold: float,
         if not sites:
             break
         batch = independent_set(sites)
+        total += apply_batch(pm, batch, dl_th)
+        round_sizes.append(len(batch))
+        rounds += 1
+    return dict(total=total, rounds=rounds, round_sizes=round_sizes,
+                converged=(rounds < max_rounds))
+
+
+def reconnect_sweep_reserve_host(pm: PaddedMesh, threshold: float,
+                                 dl_th: Optional[float] = None, veto: bool = True,
+                                 max_rounds: int = 64) -> Dict[str, object]:
+    """Host reference for schedule_warp.reconnect_sweep_warp: the iterated I->H sweep whose
+    per-round selection is the lowest-id-wins RESERVATION (reserve_independent_set_host),
+    mirroring the GPU detect->reserve->apply loop exactly.
+
+    This differs from reconnect_sweep_i_to_h only in the selection step: that one uses the
+    greedy MAXIMAL independent set; this one uses ONE reservation round (the GPU's actual
+    protocol -- see reserve_independent_set_host). So this, not reconnect_sweep_i_to_h, is
+    the faithful per-round host mirror the GPU sweep is gated against."""
+    if dl_th is None:
+        dl_th = threshold
+    total = 0
+    round_sizes = []
+    rounds = 0
+    while rounds < max_rounds:
+        sites = find_short_edges_csr(pm, threshold)
+        if veto:
+            sites = [s for s in sites if i_to_h_veto_csr(pm, s[2]) is None]
+        if not sites:
+            break
+        batch = reserve_independent_set_host(sites)
         total += apply_batch(pm, batch, dl_th)
         round_sizes.append(len(batch))
         rounds += 1

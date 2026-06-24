@@ -449,12 +449,56 @@ own CUDA runtime; mixing with TF's conda CUDA risks conflicts) — use a separat
     won set conflict-free + non-empty; disjoint candidates both admitted; **parallel apply
     == host sequential apply** (body-anchored fingerprint) on 2 disjoint configs and on a
     reserved Kelvin batch. 27 GPU tests total, all green.
-  - ▶ **next**: (a) wire reserve+apply+re-detect into a single GPU iterated sweep
-    (`reconnect_sweep_warp`, glue over C0/C2a/C2b — meaningful with dynamics, see the C1
-    cascade finding); (b) on-GPU detection (currently host); (c) the H→I reverse direction
-    in the scheduler. Then **Gate D** (stream-compaction of dead slots — the bump
-    allocator's +3 verts/op makes this needed for long runs), then **Gate E** (force +
-    integration kernels + Fig 1E/1F sorting validation vs the CPU oracle).
+  - ✅ **C2c — the iterated sweep, glued on the GPU** (2026-06-24):
+    `schedule_warp.reconnect_sweep_warp(g, threshold, dl_th)` runs the cellGPU iterated-batch
+    loop end-to-end on the device: each round `PaddedMesh.from_warp(g)` (slot-preserving)
+    → host detect (`find_short_edges_csr` + Cond-4 veto) → GPU reserve (C2a) → GPU parallel
+    apply (C2b, mutates `g`) → re-detect, bounded by `max_rounds`. Host mirror added:
+    `schedule_csr.reconnect_sweep_reserve_host` (+`reserve_independent_set_host`). Test
+    `rnr/tests/test_gpu_sweep.py` (3): **one GPU round == one host RESERVATION round**
+    (body-anchored fingerprint) — round 1 shares the host's slot layout so it's exact by
+    composition of C2a (bit-for-bit) + C2b (fingerprint); a bounded 3-round device sweep
+    re-detects on the mutated mesh and stays consistent each round; a sub-threshold sweep is
+    a 0-round no-op. **30 GPU tests total, all green.**
+    - **Subtlety that mattered:** the per-round mirror is `reconnect_sweep_reserve_host`
+      (reservation), NOT `reconnect_sweep_i_to_h` (greedy maximal). Greedy keeps a candidate
+      if it is disjoint from the WINNERS so far; one reservation round keeps it only if it is
+      disjoint from ALL lower-id candidates (winners *and* losers) — strictly more restrictive.
+      Measured on the n=4 Kelvin block: **360 candidates → greedy 10, one reservation round 1.**
+      Gating the GPU sweep (reservation) against the greedy host sweep would have compared
+      1 reconnection vs 10 and failed.
+    - **Efficiency finding (not correctness):** deterministic lowest-id-wins is very
+      *non-maximal* on a DENSE candidate set (1/360 here) — it admits ≈one low-id "seed" per
+      round, so a dense static batch resolves almost serially. This is a worst case of the
+      static Kelvin block (uniform short edges ⇒ every edge a candidate). In production only
+      a few edges fall below threshold per step (sparse, mostly disjoint) so one round admits
+      most of them. If dense batches ever matter, cellGPU's **randomised per-round priorities**
+      (re-rolled each round) give a near-maximal set in O(log n) rounds — but that trades the
+      bit-for-bit host match (the current validation anchor) for a statistical one; deferred.
+  - ✅ **C0′ — the reverse-direction [H] detector** (2026-06-24): `topology_csr`
+    `h_neighbourhood_csr` + `find_small_triangles_csr` — the index-world mirror of
+    `topology.h_neighbourhood`/`find_small_triangles` (no TF handles), emitting the same
+    `HCfgIdx` that `h_to_i_csr` consumes. Condition-2 triggers on the **MAX** triangle edge
+    (not min — Honda's wrong "condition H"). Test `rnr/tests/test_gpu_topology_h_csr.py` (3):
+    one I→H makes one triangle the detector finds + reverses via the *detected* config to
+    restore [I]; a fresh [I]-only Kelvin block (no triangular faces) yields zero sites; a
+    batch of N I→H is detected and the canonical cap-cap sites reverse to restore the
+    fingerprint. **33 GPU tests total, all green.**
+    - **Reverse-direction cascade FINDING:** an I→H can collapse a *quad* side-face
+      `[outer_top, v10, v11, outer_bot]` into a triangle `[outer_top, tri_k, outer_bot]` — a
+      genuine, immediately-reverse-reconnectable [H] site. So one I→H yields the cap-cap
+      triangle **plus** ≥0 side-collapse triangles (measured 1 extra per op on one Kelvin
+      block ⇒ detector finds 2N, not N). They **share** the new tri vertex with their cap-cap
+      triangle (overlapping footprints), so a reverse sweep must schedule them as conflicts —
+      reversing only the cap-cap sites re-expands the side-faces back to quads. This is the
+      H→I analogue of the forward C1 cascade; production force-relaxation separates the scales.
+  - ▶ **next**: (a) finish the H→I scheduler — H-footprint (3 tri + 6 outer verts / triangle +
+    9 faces / 5 cells) + reservation (mirror C2a with the H sizes) + `h_to_i_batch_kernel`
+    (mirror `i_to_h_batch_kernel`) + a reverse sweep; round-trip gate as always; (b) on-GPU
+    detection (port the scans to parallel kernels so a sweep never returns to the host). Then
+    **Gate D** (stream-compaction of dead slots — the bump allocator's +3 verts/op makes this
+    needed for long runs), then **Gate E** (force + integration kernels + Fig 1E/1F sorting
+    validation vs the CPU oracle).
 
 **Risks to confront in this order:** (1) Warp on sm_120 actually initializes → verify *first*;
 (2) the parallel slot allocator + count-changing surgery (Gate B) — the real research risk;
