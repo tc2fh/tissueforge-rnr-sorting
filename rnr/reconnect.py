@@ -100,19 +100,24 @@ def _refresh(surfaces=(), bodies=()) -> None:
 # --------------------------------------------------------------------------------------
 # Okuda Appendix-1 vertex placement
 # --------------------------------------------------------------------------------------
-def place_i_to_h(cfg: "topo.IConfig", dl_th: float) -> List[np.ndarray]:
+# The numerical core of each placement is factored into a pure position-array function
+# (`*_xyz`, no TF handles) so the GPU port (rnr/gpu/reconnect_csr.py) reuses the EXACT
+# same Okuda formula -- one source of truth, no silent fp drift between the CPU oracle and
+# the GPU round-trip. The cfg-based wrappers below just gather positions and delegate.
+def place_i_to_h_xyz(p10: np.ndarray, p11: np.ndarray,
+                     outer_tops: List[np.ndarray], outer_bots: List[np.ndarray],
+                     dl_th: float) -> List[np.ndarray]:
     """Positions of the 3 triangle vertices (one per arm), Okuda Eqs. 46-56.
 
-    Arm k's triangle vertex pairs that arm's two outer vertices (the 1<->4 / 2<->5 / 3<->6
-    coupling, derived from the side faces in topology.py).
+    `outer_tops[k]` / `outer_bots[k]` are arm k's two outer-vertex positions (the
+    1<->4 / 2<->5 / 3<->6 coupling). Pure numpy; takes positions, returns positions.
     """
-    p10, p11 = _np(cfg.v10.position), _np(cfg.v11.position)
     r0 = 0.5 * (p10 + p11)                                  # Eq. 50: edge midpoint
     uT = _unit(p10 - p11)                                   # Eq. 49: edge axis
     vproj = []
-    for a in cfg.arms:
-        d_top = _unit(_np(a.outer_top.position) - r0)
-        d_bot = _unit(_np(a.outer_bot.position) - r0)
+    for ot, ob in zip(outer_tops, outer_bots):
+        d_top = _unit(ot - r0)
+        d_bot = _unit(ob - r0)
         w = 0.5 * (d_top + d_bot)                           # Eqs. 54-56
         vproj.append(w - np.dot(w, uT) * uT)                # Eqs. 51-53: project off edge
     # L_max = largest edge of the triangle formed by the projected v-vectors.
@@ -123,23 +128,40 @@ def place_i_to_h(cfg: "topo.IConfig", dl_th: float) -> List[np.ndarray]:
     return [r0 + (dl_th / l_max) * vp for vp in vproj]       # Eqs. 46-48
 
 
-def place_h_to_i(cfg: "topo.HConfig", dl_th: float) -> Tuple[np.ndarray, np.ndarray]:
+def place_h_to_i_xyz(tri_pts: List[np.ndarray], outer_tops: List[np.ndarray],
+                     dl_th: float) -> Tuple[np.ndarray, np.ndarray]:
     """Positions of the 2 recovered edge vertices (v10, v11), Okuda Eqs. 42-45.
 
-    v10 is placed toward the cap_top side, v11 toward cap_bot, so the recovered edge has
-    the same orientation the I->H build used (needed for a clean round-trip). The side is
-    chosen from the outer-vertex clusters rather than a stored normal sign, so it is
-    robust to triangle winding.
+    `tri_pts` are the 3 triangle-vertex positions; `outer_tops` the 3 cap_top-side outer
+    positions (used only to orient the normal). Pure numpy; takes positions, returns the
+    (v10, v11) pair with v10 toward the cap_top side.
     """
-    p = [_np(a.tri_vertex.position) for a in cfg.arms]
+    p = tri_pts
     r0 = (p[0] + p[1] + p[2]) / 3.0                          # Eq. 45: triangle centroid
     n = _unit(np.cross(p[1] - p[0], p[2] - p[0]))            # Eq. 44: triangle unit normal
     # orient n toward the cap_top-side outer vertices.
-    top_mean = np.mean([_np(a.outer_top.position) for a in cfg.arms], axis=0)
+    top_mean = np.mean(outer_tops, axis=0)
     if np.dot(top_mean - r0, n) < 0:
         n = -n
     half = 0.5 * dl_th
     return r0 + half * n, r0 - half * n                      # Eqs. 42-43
+
+
+def place_i_to_h(cfg: "topo.IConfig", dl_th: float) -> List[np.ndarray]:
+    """Triangle-vertex placement for an I->H from a TF-handle IConfig (delegates to
+    place_i_to_h_xyz). Arm k's triangle vertex pairs that arm's two outer vertices."""
+    p10, p11 = _np(cfg.v10.position), _np(cfg.v11.position)
+    outer_tops = [_np(a.outer_top.position) for a in cfg.arms]
+    outer_bots = [_np(a.outer_bot.position) for a in cfg.arms]
+    return place_i_to_h_xyz(p10, p11, outer_tops, outer_bots, dl_th)
+
+
+def place_h_to_i(cfg: "topo.HConfig", dl_th: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Edge-vertex placement for an H->I from a TF-handle HConfig (delegates to
+    place_h_to_i_xyz). v10 lands toward cap_top, v11 toward cap_bot."""
+    tri_pts = [_np(a.tri_vertex.position) for a in cfg.arms]
+    outer_tops = [_np(a.outer_top.position) for a in cfg.arms]
+    return place_h_to_i_xyz(tri_pts, outer_tops, dl_th)
 
 
 # --------------------------------------------------------------------------------------

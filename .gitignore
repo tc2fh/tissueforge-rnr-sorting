@@ -4,9 +4,12 @@
 # Nested repositories tracked SEPARATELY -- never vendored into this repo:
 #   tissue-forge/    = the engine FORK (its own git + remote tc2fh/tissue-forge)
 #   tvm/, 3DVertVor/ = GPL upstream oracles (read-only references; license boundary)
+#   cellGPU/, VertAX/ = GPU-port reference oracles (their own .git; study, don't vendor)
 tissue-forge/
 tvm/
 3DVertVor/
+cellGPU/
+VertAX/
 
 # Derived / build artifacts (regenerable, large): engine CMake build tree + built oracle
 tissue-forge_build/
@@ -14,6 +17,7 @@ oracle_run/
 
 # Third-party reference PDFs (kept locally; not committed/redistributed)
 reference_pdfs/
+gpu_reference_papers/
 
 # Tooling / OS junk
 __pycache__/
@@ -36,3 +40,7 @@ rnr/exports/sweep_run*.log
 rnr/exports/sort_active_frames/
 rnr/exports/vertex_motion_frames/
 rnr/exports/native_gl_frames/
+rnr/exports/native_cells_frames/
+rnr/exports/native_cells_frames_clipmz/
+rnr/exports/native_gl_frames_clipmz/
+rnr/exports/unstable_dt0.005/

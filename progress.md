@@ -2,8 +2,15 @@
 
 > Companion to `CLAUDE.md`. **Canonical technical record:** `rnr/PORTING_NOTES.md`; reasoning
 > index: the auto-memory under `.claude/.../memory/`; per-session logs: `docs/sessions/`.
-> Last updated: **2026-06-21** — engine now builds + 48-test gate green on **linux-64 (WSL2)**, not just
-> osx-arm64 (see `docs/sessions/2026-06-21-1220-linux64-build-migration.md`).
+> Last updated: **2026-06-24** — **NEW phase: GPU port** of the 3D vertex model + RNR (Warp→CUDA,
+> forward-sim only). **Gates A + B + C done & green** — the novel result is realized: parallel,
+> conflict-free, element-count-CHANGING I→H on a GPU-resident ragged 3D mesh (atomic reservation +
+> simultaneous count-changing surgery on the RTX 5090), validated against the host reference.
+> Full gate `pixi run test` → 75 passed. Next: GPU iterated sweep glue + H→I in the scheduler, then
+> Gate D (compaction) and Gate E (force kernels + Fig 1E/1F sorting). Plan + progress §10:
+> `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session log:
+> `docs/sessions/2026-06-24-0859-gpu-rnr-gate-b-and-c.md`. (Prior GPU session:
+> `docs/sessions/2026-06-24-0715-gpu-3d-vertex-port.md`.)
 
 ## Status — the Phase-2 goal is REPRODUCED ✅
 

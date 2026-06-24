@@ -69,6 +69,7 @@ libegl-devel = "*"
 # `pixi install`, comment it out and use the scipy Voronoi/Delaunay fallback (CLAUDE.md
 # Phase 0); for 3.12/3.13 see runbook section 5.
 pyvoro-mmalahe = "*"
+warp-lang = ">=1.14.0, <2"
 
 [tasks]
 # Run everything through these so the env is always the pixi one. `pixi run <task>`.
@@ -128,6 +129,13 @@ video-vertices = { cmd = "python rnr/scripts/video_native_vertices.py" }
 # (defaults 20000 0.5 0.1 6 7 250 native mixed).
 video-gl = { cmd = "python rnr/scripts/video_native_gl.py" }
 
+# WHOLE-CELL-BY-TYPE SORT VIDEO: each cell drawn as its OWN solid polyhedron (shrunk toward its
+# centroid), coloured by the cell's type (A=blue, B=red) -- so the two populations are legible, unlike
+# the by-interface face videos where cells look two-toned. matplotlib (no GL), camera-independent. MP4
+# via ffmpeg (GIF fallback). -> rnr/exports/native_cells_sort_<MODEL>_<IC>.mp4. Env: SHRINK, ELEV, AZIM,
+# ROTATE=1 (turntable), FPS. Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY MODEL IC] (defaults as video-gl).
+video-cells = { cmd = "python rnr/scripts/video_native_cells.py" }
+
 # FULL ensemble + video + figures: 18 sims (sigma x seed x mixed/demixed, 100k steps) with a
 # bounded-concurrency, failure-tolerant pool, then fig1e/fig1f. Background-friendly.
 # Args: [MAXPAR NSTEPS] (defaults 3 100000).
@@ -144,6 +152,11 @@ sweep = { cmd = "python rnr/scripts/run_sweep.py" }
 dpmax = { cmd = "python rnr/scripts/compute_dpmax.py" }
 fig1e = { cmd = "python rnr/scripts/fig1e_demixing.py" }
 fig1f = { cmd = "python rnr/scripts/fig1f_stability.py" }
+
+# --- GPU port (docs/2026-06-24_gpu-3d-vertex-model-exploration.md) -----------------
+# Gate A: extract the TF mesh into the index-based CSR/SoA layout, verify it round-trips
+# TF exactly, and upload it to the GPU. Args: [N SPAN] (Kelvin block; defaults 4 8).
+gpu-csr = { cmd = "python rnr/scripts/gpu_csr_demo.py" }
 
 # Convenience: full check before committing.
 check = { depends-on = ["verify", "test"] }
