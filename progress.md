@@ -3,15 +3,17 @@
 > Companion to `CLAUDE.md`. **Canonical technical record:** `rnr/PORTING_NOTES.md`; reasoning
 > index: the auto-memory under `.claude/.../memory/`; per-session logs: `docs/sessions/`.
 > Last updated: **2026-06-24** — **NEW phase: GPU port** of the 3D vertex model + RNR (Warp→CUDA,
-> forward-sim only). **Gates A + B + C done & green** (incl. **C2c** — the iterated I→H sweep glued
-> end-to-end on the GPU) — the novel result is realized: parallel, conflict-free, element-count-CHANGING
-> I→H on a GPU-resident ragged 3D mesh (atomic reservation + simultaneous count-changing surgery on the
-> RTX 5090), validated against the host reference. The **H→I reverse detector (C0′)** is also done.
-> Full gate `pixi run test` → **81 passed**. Next: finish the H→I scheduler (host footprint/reserve +
-> `h_to_i_batch_kernel`), then on-GPU detection, Gate D (compaction), Gate E (force kernels + Fig 1E/1F
-> sorting). Plan + progress §10: `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session
-> log: `docs/sessions/2026-06-24-0938-gpu-rnr-gate-c-sweep-and-h-detector.md`. (Prior GPU sessions:
-> `docs/sessions/2026-06-24-0859-gpu-rnr-gate-b-and-c.md`, `…-0715-gpu-3d-vertex-port.md`.)
+> forward-sim only). **THE FULL STAGED PLAN (Gates A–E) IS DONE & green.** Gates A–D + the H→I scheduler
+> + on-GPU detection + device gather (a whole reconnection round runs with NO `from_warp`), PLUS **Gate E**
+> — Stage-1 physics: geometry + the 4 sorting forces + overdamped integrate + director rotational
+> diffusion as fp64 Warp kernels, composed into `engine.forward_step`, validated host==TF (float32),
+> GPU==host (fp64), a deterministic GPU trajectory == host to 9e-16, and a mixed IC that demixes
+> (3DVertVor cell sorting on the GPU). Full gate `pixi run test` → **127 passed** (79 GPU tests on the
+> RTX 5090). Next (optional, post-plan): **batched multi-mesh stepping** (kernels already run on a
+> disjoint-union SoA → the 18-sim Fig 1E/1F ensemble in ~one run), a 100k-step stability check (likely
+> re-add flat/convex), a faster periodic-foam builder, then hand-CUDA-in-fork. Plan + progress §10:
+> `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session log:
+> `docs/sessions/2026-06-24-1650-gpu-rnr-gate-e-physics-engine-sorting.md`.
 
 ## Status — the Phase-2 goal is REPRODUCED ✅
 

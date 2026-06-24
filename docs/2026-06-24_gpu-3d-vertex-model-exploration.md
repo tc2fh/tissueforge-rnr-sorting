@@ -580,11 +580,47 @@ own CUDA runtime; mixing with TF's conda CUDA risks conflicts) — use a separat
     - **Warp gotcha:** a cross-module `@wp.func` (here `d_vert_body_count` from `detect_warp`) MUST be
       imported into the calling module's namespace or the kernel fails to compile with
       "Referencing undefined symbol" (surfaced via `module.load(dev)`, not the bare pytest trace).
-  - **60 GPU tests total, all green** (was 49). ▶ **next**: **Gate E** (force/geometry/integration
-    kernels: volume + surface-area + tension gradients, overdamped step + active drive; wire a full
-    forward step and validate end-to-end Fig 1E/1F sorting STATISTICALLY vs the CPU oracle —
-    determinism stops mattering there). Optional perf: port the trigger scans' compaction to a device
-    prefix-sum so candidate indices never round-trip (currently O(cands) readback, not O(mesh)).
+  - **60 GPU tests total, all green** (was 49).
+  - ✅ **Gate E — Stage-1 physics: force/geometry/integration kernels + end-to-end sorting**
+    (2026-06-24): the compute-dominant phases ported to Warp on the CSR/SoA, composed into a full
+    forward step, validated against TF and a host reference. **The GPU 3D vertex engine now runs a
+    complete step entirely on-device and SORTS.** Built host-reference-first (the `reconnect_csr` →
+    `reconnect_warp` methodology):
+    - **Host reference** `rnr/gpu/physics_csr.py` — geometry (surface centroid/area/unnormalized
+      normal; body volume/area/centroid/orientSign, periodic min-image, first-vertex/first-surface
+      floating origin) + the FOUR sorting-physics forces re-derived from the LGPL TF actors (read,
+      not copied; each cites its actor): VolumeConstraint, SurfaceAreaConstraint (body variant),
+      Adhesion (heterotypic σ, body variant = `0.25·λ·dA_s/dx` over het faces), and the active drive
+      `v0·⟨incident directors⟩`; plus the overdamped integrator. TF's auto-bound mesh-hygiene
+      regularizers (FlatSurfaceConstraint/ConvexPolygonConstraint, λ=0.1) are intentionally OMITTED
+      (not the sorting physics). **Gate** `test_gpu_physics_csr.py` (7): geometry == TF
+      `b.volume`/`b.area`/`b.centroid`/`s.area` to **float32 ε** (vol_rel 1.2e-7); each force == TF's
+      directly-callable `actor.force(body,vertex)` to **float32** (vol 2.7e-5, area 5.3e-5, adhesion
+      3.5e-5, active 4e-16). *Subtlety that mattered:* a monodisperse Kelvin foam has ~0 NET
+      volume/area force at every vertex (Σ_cell dV/dx=0 by space-filling + Kelvin symmetry), so TF's
+      float32 per-cell forces (~1e6) cancel to pure noise — the gate needs a **jittered polydisperse
+      foam + v0/a0 at the cell mean** to be well-conditioned.
+    - **GPU kernels** `rnr/gpu/physics_warp.py` — surface_geom / body_geom / force / integrate /
+      director-update kernels, **fp64**. The per-body force sum is restructured as a per-(surface,body)
+      sum (a body defines s ⟺ it's in s2b[s]) so NO body dedup is needed for the conservative forces;
+      only the active mean needs the small O(valence²) first-occurrence dedup. **Gate**
+      `test_gpu_physics_warp.py` (9): geometry/forces == host to **fp64** (~1e-14); integrator ==
+      host + wraps into [0,L); active displacement == dt·v0·⟨n⟩ (5e-15); director rotational-diffusion
+      Dr_eff=1.5·rate ≈ Dr (probe_native_calibration Part B, on-GPU). *Warp gotcha:* every fp64 literal
+      meeting a `wp.float64` value must itself be `wp.float64(...)` ("Input types must be the same",
+      which makes the referenced `@wp.func` "undefined").
+    - **Composed engine** `rnr/gpu/engine.py` — `forward_step` = director → geometry → force →
+      integrate → `reconnect_sweep_*_warp_device` (throttled, both directions) → `compact_warp`; plus
+      the demixing order parameter `het_contact_fraction`. **Gate** `test_gpu_engine.py` (3): ~60-step
+      run stays consistent/finite/positive-volume with slots bounded by compaction (47 reconnections);
+      **the deterministic (Dr=0, no-RNR) GPU trajectory == the host reference to fp64 (~9e-16) over 12
+      steps — THE "matches the CPU oracle" gate**; and from a MIXED IC the het-contact fraction
+      demixes 0.48→0.42 under heterotypic tension (the GPU engine reproduces 3DVertVor cell sorting).
+      Foam scaled to unit cells so production params (V0≈1, A0≈5.6) apply.
+    - **79 GPU tests total, all green** (was 60). **Gate E DONE — the full staged GPU-port plan
+      (A–E) is complete.** ▶ **next** (optional, post-plan): port the trigger-scan compaction to a
+      device prefix-sum (O(cands) readback → none); a larger/longer sort for a publication-grade Fig
+      1E/1F vs the TF oracle; then the hand-CUDA-in-fork port (the two-vehicle plan's second leg).
 
 **Risks to confront in this order:** (1) Warp on sm_120 actually initializes → verify *first*;
 (2) the parallel slot allocator + count-changing surgery (Gate B) — the real research risk;
