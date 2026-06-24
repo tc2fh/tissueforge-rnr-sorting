@@ -1280,3 +1280,67 @@ parasitic artifact, not the sorting mechanism. The re-rendered `pixi run sort-vi
 a clean space-filling tissue throughout (final min_vol +2.97, D −0.096). Flagged DEPARTURE
 (§5): the native port still uses abs(volume) and DROPS this clamp. Unit tests:
 `rnr/tests/test_stability.py` (the pure `_clamp_to` math).
+
+
+---
+
+## 8. Headless GL screenshot fixed — `tf.system.screenshot()` was UB for every format except JPEG (RESOLVED, 2026-06-23)
+
+**Symptom.** On linux-64/WSL2, `tf.system.screenshot("foo.png")` aborted the process
+(exit 134) with `Trade::AbstractImageConverter::convertToData(): can't convert image with a
+zero size: Vector(0, <garbage>)`. The garbage (changing) height = an uninitialised
+`ImageView2D`. This had been mis-attributed to the WSL2 Mesa/Zink GL driver; it is actually a
+**TissueForge bug**, independent of the driver.
+
+**Not the driver.** The windowless **EGL** context is created fine here — Mesa auto-falls-back
+to `llvmpipe` (OpenGL 4.5), logged as `created windowless context, EGL Context...`. The
+`ZINK: failed to choose pdev` / `failed to create dri2 screen` lines come only from
+`tf.system.egl_info()`'s verbose probe of the GBM platform and from the interactive **GLFW**
+window path — neither blocks the offscreen framebuffer. Proof the render+readback works:
+`tf.system.image_data()` (the Jupyter-widget path) returns a valid 139 KB JPEG, and a
+1-particle scene screenshots correctly to an 800×600 PNG once the bug below is fixed.
+
+**Root cause (function-pointer signature mismatch → UB).** In
+`source/rendering/tfApplication.cpp`:
+- the dispatch typedef was `typedef Array<char> (*imgCnv_t)(ImageView2D);` — argument **by value**;
+- but every converter in `tfImageConverters.{h,cpp}` takes `const ImageView2D&` — **by reference**:
+  `convertImageDataToPNG/BMP/HDR/TGA`, `convertImageDataToJpeg`.
+
+`PNGImageData()` etc. did `getImageData((imgCnv_t)convertImageDataToPNG, ...)` — a C-style cast
+of a `(*)(const ImageView2D&)` to the incompatible `(*)(ImageView2D)` and then **called through
+it**. A >16-byte struct passed by value vs. by reference are different calling conventions on
+the SysV AMD64 ABI, so the callee read a garbage `ImageView2D` (width 0) → zero-size image →
+`convertToData` assert → abort. **JPEG was the lone survivor** because `JpegImageData()` passed
+a *by-value lambda* `[](ImageView2D image){...}` that happened to match the wrong typedef; and
+because the only screenshot path most users hit (the Jupyter widget) is JPEG via
+`image_data()`, the bug went unnoticed upstream.
+
+Discriminator matrix (each shot first/sole in a fresh process, pre-fix):
+
+| ext | PixelFormat | converter passed as | result |
+|-----|-------------|---------------------|--------|
+| jpg | RGB8Unorm   | by-value **lambda** | ✅ 800×600 |
+| bmp | RGB8Unorm   | direct cast (by-ref fn) | ✗ abort |
+| png | RGBA8Unorm  | direct cast (by-ref fn) | ✗ abort |
+| hdr | RGB32F      | direct cast (by-ref fn) | ✗ abort |
+| tga | RGBA8Unorm  | direct cast (by-ref fn) | ✗ 0 bytes (Tga converter no-asserts) |
+
+jpg vs bmp is the tell: identical PixelFormat (RGB8Unorm) and identical `StbImageConverter`
+class — the *only* difference is by-value-lambda vs by-reference-cast. So it is the call
+convention, not the pixel format or the converter.
+
+**Fix (clamp-free, 1 line of real change).** Make the typedef match the actual converters:
+`typedef Array<char> (*imgCnv_t)(const ImageView2D&);` and change the JPEG lambda param to
+`const ImageView2D&`. Now every `(imgCnv_t)convertImageDataToXxx` cast is an exact, no-op
+identity conversion — no UB. After rebuild, all five formats produce valid 800×600 files
+(png 27 KB, bmp 1.44 MB, jpg 139 KB, tga 1.92 MB, hdr 85 KB), exit 0; a real 216-cell
+vertex-model scene renders headlessly via TF's own GL path (surfaces need
+`SurfaceTypeSpec.style = {"color": ..., "visible": True}` to be drawn).
+
+**Seam for the C++ fork:** purely an engine-source fix in `tfApplication.cpp` (no Python API
+change). `tf.system.screenshot(path)` / `image_data()` now work windowless on linux-64. The
+matplotlib fallback `rnr/scripts/shot_native_sort.py` is no longer required for headless stills,
+though it stays useful for per-cell-type-pair colouring (TF colours a surface by its *surface*
+type, not by the cell-type pair, so the blue/red/gold scheme still needs per-surface styling).
+The interactive `tf.run()` GLFW window is a *separate* path (GLFW context + GPU selection) and
+is not addressed by this fix.

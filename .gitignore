@@ -35,3 +35,4 @@ rnr/exports/sweep_logs/
 rnr/exports/sweep_run*.log
 rnr/exports/sort_active_frames/
 rnr/exports/vertex_motion_frames/
+rnr/exports/native_gl_frames/

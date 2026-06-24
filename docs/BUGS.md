@@ -18,6 +18,7 @@ Paths are relative to `tissue-forge/`. Last updated 2026-06-23.
 | 6 | `Mesh::setQuality` SWIG double-free | bindings | Med | FIXED-IN-FORK |
 | 7 | SWIG sub-`.i`/header edits skip Python-wrapper regen | build | Low | WORKAROUND |
 | 8 | Headless/singleton `tf.init()` foot-guns | init | Low | KNOWN |
+| 9 | Headless `screenshot()` UB: by-value `imgCnv_t` calls by-ref converters | rendering | High (headless) | FIXED-IN-FORK |
 
 ---
 
@@ -117,6 +118,35 @@ dependencies to the SWIG custom command. Ref: PORTING_NOTES §6, memory `tf-swig
 (b) `tf.init()` is a non-reentrant singleton — a 2nd call in one process hangs (forces subprocess-per-
 test). Arguably documented behaviour, but both are easy foot-guns worth a clear error instead of a hang.
 Ref: PORTING_NOTES §0.
+
+---
+
+## 9. Headless `screenshot()` is UB for every format except JPEG  *(FIXED-IN-FORK)*
+
+**Symptom.** `tf.system.screenshot("x.png")` (and `.bmp`/`.hdr`) aborts the process (exit 134) with
+`Trade::AbstractImageConverter::convertToData(): can't convert image with a zero size: Vector(0, <garbage>)`;
+`.tga` silently writes 0 bytes. Only `.jpg` and `tf.system.image_data()` (JPEG) work. Long mis-blamed on
+the WSL2 Mesa/Zink driver — but the windowless EGL context is fine (auto-`llvmpipe` GL 4.5), and JPEG
+proves render+readback work. It is a **TissueForge bug**, driver-independent.
+
+**Root cause.** `source/rendering/tfApplication.cpp` declared the dispatch typedef
+`typedef Array<char> (*imgCnv_t)(ImageView2D);` — argument **by value** — but every converter in
+`tfImageConverters.{h,cpp}` takes `const ImageView2D&` (**by reference**). `PNGImageData()` etc. did
+`getImageData((imgCnv_t)convertImageDataToPNG, …)`, C-casting a `(*)(const ImageView2D&)` to the
+incompatible by-value type and calling through it. By-value (a >16-byte struct) vs by-reference are
+different SysV AMD64 calling conventions ⇒ the callee reads a garbage `ImageView2D` (width 0) ⇒ zero-size
+image ⇒ `convertToData` assert ⇒ abort. JPEG escaped only because `JpegImageData()` passed a *by-value
+lambda* matching the wrong typedef — and the widely-used path (Jupyter widget = `image_data()`) is JPEG,
+so it went unnoticed upstream. (jpg vs bmp is the tell: same `RGB8Unorm`, same `StbImageConverter` —
+only by-value-lambda vs by-ref-cast differs.)
+
+**Fix.** Make the typedef match the real converters: `typedef Array<char> (*imgCnv_t)(const ImageView2D&);`
+and change the JPEG lambda param to `const ImageView2D&`. Every `(imgCnv_t)convertImageDataToXxx` cast is
+then an exact identity — no UB. After `pixi run build-tf`, all five formats write valid 800×600 files
+(png/bmp/jpg/tga/hdr), exit 0; the vertex mesh renders headlessly (surfaces need
+`SurfaceTypeSpec.style = {"color":…, "visible":True}`). Engine-source only; no Python API change.
+Full write-up: PORTING_NOTES §8; memory `tf-gl-render-broken-wsl2`. (The interactive `tf.run()` GLFW
+window is a separate path, not covered.)
 
 ---
 

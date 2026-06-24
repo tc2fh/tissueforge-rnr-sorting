@@ -121,6 +121,13 @@ watch-native = { cmd = "python rnr/scripts/watch_native_sort_window.py" }
 # Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY MODEL ROTATE] (defaults 40000 0.5 0.1 6 7 500 native 0).
 video-vertices = { cmd = "python rnr/scripts/video_native_vertices.py" }
 
+# NATIVE-GL SORT VIDEO: each frame is a real tf.system.screenshot() of TF's OWN renderer (needs the
+# headless-screenshot fix, BUGS.md #9), cells coloured by type pair (blue A|A, red B|B, gold A|B). MP4
+# via ffmpeg (GIF fallback). -> rnr/exports/native_gl_sort_<MODEL>_<IC>.mp4. Env: HET_ONLY=1 (only gold
+# interfaces), FPS, VIEW=front|top|right|...  Args: [N_STEPS SIGMA V0 M SEED CAPTURE_EVERY MODEL IC]
+# (defaults 20000 0.5 0.1 6 7 250 native mixed).
+video-gl = { cmd = "python rnr/scripts/video_native_gl.py" }
+
 # FULL ensemble + video + figures: 18 sims (sigma x seed x mixed/demixed, 100k steps) with a
 # bounded-concurrency, failure-tolerant pool, then fig1e/fig1f. Background-friendly.
 # Args: [MAXPAR NSTEPS] (defaults 3 100000).
