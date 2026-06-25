@@ -8,6 +8,7 @@ One forward step ties together everything built for Gate E and the RNR path:
  -> overdamped integrate x+=dt*f    (physics_warp.integrate_warp)
  -> RNR reconnection both ways      (schedule_warp.reconnect_sweep_*_warp_device)   [throttled]
  -> stream-compaction               (compact_warp.compact_warp)                     [bounds slots]
+ -> winding/closure repair          (orient_warp.orient_repair_warp)                [keeps cells closed]
 
 mirrors a TissueForge vertex step (director update in preStepStart, then force/integrate, then
 doQuality reconnection). Reconnection is THROTTLED (every `interval` steps, as in the engine's
@@ -25,6 +26,7 @@ import numpy as np
 from . import physics_warp as W
 from .compact_warp import compact_warp
 from .device_mesh import PaddedMesh
+from .orient_warp import orient_repair_warp
 from .schedule_warp import (reconnect_sweep_h_to_i_warp_device,
                             reconnect_sweep_warp_device)
 
@@ -49,6 +51,10 @@ def forward_step(g: dict, phys: dict, params, dt: float, dr: float, seed: int, s
         ni, nh = ri["total"], rh["total"]
         if compact and (ni + nh) > 0:
             compact_warp(g)
+        # heal any b1/b2-inconsistent windings (near-degenerate initial faces + occasional
+        # surgery output) so every cell stays CLOSED and its divergence-theorem volume is
+        # correct -- without this the mesh balloons at scale (orient_warp / §6p).
+        orient_repair_warp(g)
     nu = g["n_used"].numpy()
     return dict(i=ni, h=nh, nv=int(nu[0]), ns=int(nu[1]))
 
