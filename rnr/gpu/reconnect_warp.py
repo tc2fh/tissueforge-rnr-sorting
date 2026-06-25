@@ -740,6 +740,255 @@ def apply_h_to_i_batch_warp(g: dict, batch, dl_th: float):
 
 
 # ======================================================================================
+# Option A: DEVICE-RESIDENT apply -- consume the gather's packed device arrays DIRECTLY
+# (gather_warp.gather_i_configs_warp / gather_h_configs_warp), gated by an on-device `won`
+# mask, so the whole detect->reserve->apply round runs with no per-candidate host round-trip.
+#
+# These are the *_batch_kernel bodies indexed by tid, with two differences only:
+#   (1) a leading `if won[i] == 0: return` -- the reservation winners (1) and everyone else
+#       (invalid candidates + reservation losers) skip, so we launch over ALL M gathered
+#       candidates and the kernel selects the conflict-free winning set in place; and
+#   (2) no out_tri/out_T/out_nv outputs -- the device sweep only needs the winner COUNT
+#       (summed from `won` on the host), never the post-state cfg, so dropping them removes
+#       the apply's host readback entirely.
+# The math (Okuda placement + ragged-ring surgery) is byte-identical to the batch kernels;
+# the winners' footprints are disjoint by construction (the reservation), so concurrent
+# surgeries are race-free exactly as in the gated *_batch_kernel.
+# ======================================================================================
+@wp.kernel
+def apply_i_to_h_won_kernel(
+        vert_pos: wp.array(dtype=wp.vec3d), vert_alive: wp.array(dtype=wp.int32),
+        v2s: wp.array2d(dtype=wp.int32), v2s_len: wp.array(dtype=wp.int32),
+        surf_alive: wp.array(dtype=wp.int32),
+        s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
+        s2b: wp.array2d(dtype=wp.int32),
+        b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
+        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64, box: wp.vec3d,
+        won: wp.array(dtype=wp.int32),
+        c_v10: wp.array(dtype=wp.int32), c_v11: wp.array(dtype=wp.int32),
+        c_cap_top: wp.array(dtype=wp.int32), c_cap_bot: wp.array(dtype=wp.int32),
+        c_arm_side: wp.array2d(dtype=wp.int32), c_arm_otop: wp.array2d(dtype=wp.int32),
+        c_arm_obot: wp.array2d(dtype=wp.int32),
+        c_top: wp.array2d(dtype=wp.int32), c_bot: wp.array2d(dtype=wp.int32)):
+    i = wp.tid()
+    if won[i] == 0:                                      # reservation losers + invalid skip
+        return
+    v10 = c_v10[i]
+    v11 = c_v11[i]
+    cap_top = c_cap_top[i]
+    cap_bot = c_cap_bot[i]
+
+    v0 = wp.atomic_add(n_used, 0, 3)
+    sT = wp.atomic_add(n_used, 1, 1)
+
+    p10 = vert_pos[v10]
+    p11 = vert_pos[v11]
+    d = d_minimg(p11 - p10, box)
+    r0 = p10 + wp.float64(0.5) * d
+    uT = safe_unit(-d)
+    w0 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 0]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 0]] - r0, box)))
+    vp0 = w0 - wp.dot(w0, uT) * uT
+    w1 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 1]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 1]] - r0, box)))
+    vp1 = w1 - wp.dot(w1, uT) * uT
+    w2 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 2]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 2]] - r0, box)))
+    vp2 = w2 - wp.dot(w2, uT) * uT
+    lmax = wp.max(wp.length(vp0 - vp1), wp.max(wp.length(vp0 - vp2), wp.length(vp1 - vp2)))
+    if lmax == wp.float64(0.0):
+        lmax = wp.float64(1.0)
+    sc = dl_th / lmax
+    vert_pos[v0] = d_wrapbox(r0 + sc * vp0, box)
+    vert_pos[v0 + 1] = d_wrapbox(r0 + sc * vp1, box)
+    vert_pos[v0 + 2] = d_wrapbox(r0 + sc * vp2, box)
+    vert_alive[v0] = 1
+    v2s_len[v0] = 0
+    vert_alive[v0 + 1] = 1
+    v2s_len[v0 + 1] = 0
+    vert_alive[v0 + 2] = 1
+    v2s_len[v0 + 2] = 0
+
+    for k in range(3):
+        s = c_arm_side[i, k]
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, s, v10, v0 + k)
+        d_drop_v(s2v, s2v_len, v2s, v2s_len, s, v11)
+
+    for t in range(3):
+        face = c_top[i, t]
+        Lf = s2v_len[face]
+        pi = d_ring_pos(s2v, s2v_len, face, v10)
+        prev_v = s2v[face, (pi - 1 + Lf) % Lf]
+        next_v = s2v[face, (pi + 1) % Lf]
+        kp = wp.int32(-1)
+        kn = wp.int32(-1)
+        for kk in range(3):
+            if c_arm_otop[i, kk] == prev_v:
+                kp = kk
+            if c_arm_otop[i, kk] == next_v:
+                kn = kk
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, v10, v0 + kp)
+        d_insert_between(s2v, s2v_len, v2s, v2s_len, face, v0 + kn, v0 + kp, next_v)
+
+    for t in range(3):
+        face = c_bot[i, t]
+        Lf = s2v_len[face]
+        pi = d_ring_pos(s2v, s2v_len, face, v11)
+        prev_v = s2v[face, (pi - 1 + Lf) % Lf]
+        next_v = s2v[face, (pi + 1) % Lf]
+        kp = wp.int32(-1)
+        kn = wp.int32(-1)
+        for kk in range(3):
+            if c_arm_obot[i, kk] == prev_v:
+                kp = kk
+            if c_arm_obot[i, kk] == next_v:
+                kn = kk
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, v11, v0 + kp)
+        d_insert_between(s2v, s2v_len, v2s, v2s_len, face, v0 + kn, v0 + kp, next_v)
+
+    surf_alive[sT] = 1
+    s2v_len[sT] = 3
+    s2v[sT, 0] = v0
+    s2v[sT, 1] = v0 + 1
+    s2v[sT, 2] = v0 + 2
+    s2b[sT, 0] = -1
+    s2b[sT, 1] = -1
+    d_v2s_add(v2s, v2s_len, v0, sT)
+    d_v2s_add(v2s, v2s_len, v0 + 1, sT)
+    d_v2s_add(v2s, v2s_len, v0 + 2, sT)
+    d_attach_body(s2b, b2s, b2s_len, sT, cap_top)
+    d_attach_body(s2b, b2s, b2s_len, sT, cap_bot)
+
+    vert_alive[v10] = 0
+    v2s_len[v10] = 0
+    vert_alive[v11] = 0
+    v2s_len[v11] = 0
+
+
+def apply_i_to_h_device_warp(g: dict, gathered: dict, won, dl_th: float):
+    """Apply the reserved I->H winners on the device SoA `g`, ALL IN PARALLEL, reading the
+    gather's packed device arrays directly (no host cfg objects). `gathered` is the dict from
+    gather_warp.gather_i_configs_warp; `won` is the device int32 mask from reserve_i_won_device
+    (1 = winner). Launches over ALL M gathered candidates; the kernel skips won[i]==0."""
+    dev = g["device"]
+    m = int(gathered["valid"].shape[0])
+    if m == 0:
+        return
+    wp.launch(apply_i_to_h_won_kernel, dim=m, device=dev, inputs=[
+        g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
+        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th), _box_of(g),
+        won, gathered["v10"], gathered["v11"], gathered["cap_top"], gathered["cap_bot"],
+        gathered["arm_side"], gathered["arm_otop"], gathered["arm_obot"],
+        gathered["top"], gathered["bot"]])
+    wp.synchronize_device(dev)
+
+
+@wp.kernel
+def apply_h_to_i_won_kernel(
+        vert_pos: wp.array(dtype=wp.vec3d), vert_alive: wp.array(dtype=wp.int32),
+        v2s: wp.array2d(dtype=wp.int32), v2s_len: wp.array(dtype=wp.int32),
+        surf_alive: wp.array(dtype=wp.int32),
+        s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
+        s2b: wp.array2d(dtype=wp.int32),
+        b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
+        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64, box: wp.vec3d,
+        won: wp.array(dtype=wp.int32),
+        c_triangle: wp.array(dtype=wp.int32),
+        c_cap_top: wp.array(dtype=wp.int32), c_cap_bot: wp.array(dtype=wp.int32),
+        c_tri_verts: wp.array2d(dtype=wp.int32),
+        c_arm_side: wp.array2d(dtype=wp.int32), c_arm_otop: wp.array2d(dtype=wp.int32),
+        c_arm_obot: wp.array2d(dtype=wp.int32),
+        c_top: wp.array2d(dtype=wp.int32), c_bot: wp.array2d(dtype=wp.int32)):
+    i = wp.tid()
+    if won[i] == 0:
+        return
+    triangle = c_triangle[i]
+    cap_top = c_cap_top[i]
+    cap_bot = c_cap_bot[i]
+
+    p0 = vert_pos[c_tri_verts[i, 0]]
+    p1 = vert_pos[c_tri_verts[i, 1]]
+    p2 = vert_pos[c_tri_verts[i, 2]]
+    d1 = d_minimg(p1 - p0, box)
+    d2 = d_minimg(p2 - p0, box)
+    r0 = p0 + (d1 + d2) / wp.float64(3.0)
+    nrm = safe_unit(wp.cross(d1, d2))
+    tmr = (d_minimg(vert_pos[c_arm_otop[i, 0]] - r0, box) + d_minimg(vert_pos[c_arm_otop[i, 1]] - r0, box)
+           + d_minimg(vert_pos[c_arm_otop[i, 2]] - r0, box)) / wp.float64(3.0)
+    if wp.dot(tmr, nrm) < wp.float64(0.0):
+        nrm = -nrm
+    half = wp.float64(0.5) * dl_th
+
+    v0 = wp.atomic_add(n_used, 0, 2)
+    nv10 = v0
+    nv11 = v0 + 1
+    vert_pos[nv10] = d_wrapbox(r0 + half * nrm, box)
+    vert_pos[nv11] = d_wrapbox(r0 - half * nrm, box)
+    vert_alive[nv10] = 1
+    v2s_len[nv10] = 0
+    vert_alive[nv11] = 1
+    v2s_len[nv11] = 0
+
+    for k in range(3):
+        s = c_arm_side[i, k]
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, s, c_tri_verts[i, k], nv10)
+        d_insert_between(s2v, s2v_len, v2s, v2s_len, s, nv11, nv10, c_arm_obot[i, k])
+
+    for t in range(3):
+        face = c_top[i, t]
+        first = wp.int32(-1)
+        second = wp.int32(-1)
+        L = s2v_len[face]
+        for jj in range(L):
+            x = s2v[face, jj]
+            if x == c_tri_verts[i, 0] or x == c_tri_verts[i, 1] or x == c_tri_verts[i, 2]:
+                if first < 0:
+                    first = x
+                elif second < 0:
+                    second = x
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, first, nv10)
+        d_drop_v(s2v, s2v_len, v2s, v2s_len, face, second)
+
+    for t in range(3):
+        face = c_bot[i, t]
+        first = wp.int32(-1)
+        second = wp.int32(-1)
+        L = s2v_len[face]
+        for jj in range(L):
+            x = s2v[face, jj]
+            if x == c_tri_verts[i, 0] or x == c_tri_verts[i, 1] or x == c_tri_verts[i, 2]:
+                if first < 0:
+                    first = x
+                elif second < 0:
+                    second = x
+        d_replace_v(s2v, s2v_len, v2s, v2s_len, face, first, nv11)
+        d_drop_v(s2v, s2v_len, v2s, v2s_len, face, second)
+
+    d_detach_body(s2b, b2s, b2s_len, triangle, cap_top)
+    d_detach_body(s2b, b2s, b2s_len, triangle, cap_bot)
+    surf_alive[triangle] = 0
+    s2v_len[triangle] = 0
+    for k in range(3):
+        vert_alive[c_tri_verts[i, k]] = 0
+        v2s_len[c_tri_verts[i, k]] = 0
+
+
+def apply_h_to_i_device_warp(g: dict, gathered: dict, won, dl_th: float):
+    """Apply the reserved H->I winners on the device SoA `g`, ALL IN PARALLEL, reading the
+    gather's packed device arrays directly. `gathered` is the dict from
+    gather_warp.gather_h_configs_warp; `won` is the device int32 mask (1 = winner). Launches
+    over ALL M gathered candidates; the kernel skips won[i]==0."""
+    dev = g["device"]
+    m = int(gathered["valid"].shape[0])
+    if m == 0:
+        return
+    wp.launch(apply_h_to_i_won_kernel, dim=m, device=dev, inputs=[
+        g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
+        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th), _box_of(g),
+        won, gathered["tri_cand"], gathered["cap_top"], gathered["cap_bot"], gathered["tri"],
+        gathered["arm_side"], gathered["arm_otop"], gathered["arm_obot"],
+        gathered["top"], gathered["bot"]])
+    wp.synchronize_device(dev)
+
+
+# ======================================================================================
 # precision probe (risk #2): fp32 vs fp64 placement on-device, vs the numpy fp64 oracle
 # ======================================================================================
 @wp.kernel

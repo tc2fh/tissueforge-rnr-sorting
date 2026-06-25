@@ -30,11 +30,13 @@ import numpy as np
 
 import warp as wp
 
-from .detect_warp import detect_short_edges_hybrid, detect_small_triangles_hybrid
+from .detect_warp import (detect_short_edges_hybrid, detect_small_triangles_hybrid,
+                          find_short_edges_warp, find_small_triangles_warp)
 from .device_mesh import PaddedMesh
-from .gather_warp import detect_short_edges_device, detect_small_triangles_device
+from .gather_warp import gather_h_configs_warp, gather_i_configs_warp
 from .reconnect_csr import HCfgIdx, ICfgIdx
-from .reconnect_warp import apply_h_to_i_batch_warp, apply_i_to_h_batch_warp
+from .reconnect_warp import (apply_h_to_i_batch_warp, apply_h_to_i_device_warp,
+                            apply_i_to_h_batch_warp, apply_i_to_h_device_warp)
 from .schedule_csr import h_to_i_veto_csr, i_to_h_veto_csr
 from .topology_csr import find_short_edges_csr, find_small_triangles_csr
 
@@ -240,6 +242,187 @@ def reserve_h_independent_set_warp_g(g: dict, cands: List[Tuple[int, HCfgIdx]]
 
 
 # ======================================================================================
+# Option A: DEVICE-RESIDENT reservation -- read the gather's packed device arrays directly
+# (no host pack_footprints / ICfgIdx round-trip). The footprint is the SAME element set as
+# pack_footprints (8 v / 9 s / 5 b for [I]; 9 v / 10 s / 5 b for [H]); the candidate id is the
+# row index, which (because find_*_warp emits the canonical (v10,v11)/triangle order and the
+# gather preserves it) equals the host candidate id -- so the lowest-id-wins winner SET matches
+# the host reference, exactly as the gated round-1 fingerprint test requires. Invalid candidates
+# (valid==0) neither reserve nor win, so launching over ALL M rows == the host's veto-filtered
+# reservation (relative order among valid rows is preserved, and lowest-id-wins depends only on
+# relative order -- no on-device compaction or sort needed).
+# ======================================================================================
+@wp.kernel
+def reserve_i_device_kernel(
+        valid: wp.array(dtype=wp.int32),
+        v10: wp.array(dtype=wp.int32), v11: wp.array(dtype=wp.int32),
+        cap_top: wp.array(dtype=wp.int32), cap_bot: wp.array(dtype=wp.int32),
+        side: wp.array2d(dtype=wp.int32), arm_side: wp.array2d(dtype=wp.int32),
+        arm_otop: wp.array2d(dtype=wp.int32), arm_obot: wp.array2d(dtype=wp.int32),
+        top: wp.array2d(dtype=wp.int32), bot: wp.array2d(dtype=wp.int32),
+        vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+        bown: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    if valid[i] == 0:
+        return
+    wp.atomic_min(vown, v10[i], i)
+    wp.atomic_min(vown, v11[i], i)
+    for k in range(3):
+        wp.atomic_min(vown, arm_otop[i, k], i)
+        wp.atomic_min(vown, arm_obot[i, k], i)
+        wp.atomic_min(sown, arm_side[i, k], i)
+        wp.atomic_min(sown, top[i, k], i)
+        wp.atomic_min(sown, bot[i, k], i)
+        wp.atomic_min(bown, side[i, k], i)
+    wp.atomic_min(bown, cap_top[i], i)
+    wp.atomic_min(bown, cap_bot[i], i)
+
+
+@wp.kernel
+def check_i_device_kernel(
+        valid: wp.array(dtype=wp.int32),
+        v10: wp.array(dtype=wp.int32), v11: wp.array(dtype=wp.int32),
+        cap_top: wp.array(dtype=wp.int32), cap_bot: wp.array(dtype=wp.int32),
+        side: wp.array2d(dtype=wp.int32), arm_side: wp.array2d(dtype=wp.int32),
+        arm_otop: wp.array2d(dtype=wp.int32), arm_obot: wp.array2d(dtype=wp.int32),
+        top: wp.array2d(dtype=wp.int32), bot: wp.array2d(dtype=wp.int32),
+        vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+        bown: wp.array(dtype=wp.int32), won: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    if valid[i] == 0:
+        won[i] = wp.int32(0)
+        return
+    w = wp.int32(1)
+    if vown[v10[i]] != i:
+        w = wp.int32(0)
+    if vown[v11[i]] != i:
+        w = wp.int32(0)
+    for k in range(3):
+        if vown[arm_otop[i, k]] != i:
+            w = wp.int32(0)
+        if vown[arm_obot[i, k]] != i:
+            w = wp.int32(0)
+        if sown[arm_side[i, k]] != i:
+            w = wp.int32(0)
+        if sown[top[i, k]] != i:
+            w = wp.int32(0)
+        if sown[bot[i, k]] != i:
+            w = wp.int32(0)
+        if bown[side[i, k]] != i:
+            w = wp.int32(0)
+    if bown[cap_top[i]] != i:
+        w = wp.int32(0)
+    if bown[cap_bot[i]] != i:
+        w = wp.int32(0)
+    won[i] = w
+
+
+def reserve_i_won_device(g: dict, gathered: dict):
+    """One GPU reservation round over the gather's packed device arrays; return the (M,) int32
+    `won` device mask (1 = a conflict-free winner). Owners are sized to the mesh capacity and
+    seeded to M (a sentinel above every candidate id). No host data leaves the device."""
+    dev = g["device"]
+    m = int(gathered["valid"].shape[0])
+    if m == 0:
+        return wp.zeros(0, dtype=wp.int32, device=dev)
+    vown = wp.full(int(g["cap_v"]), m, dtype=wp.int32, device=dev)
+    sown = wp.full(int(g["cap_s"]), m, dtype=wp.int32, device=dev)
+    bown = wp.full(int(g["nb"]), m, dtype=wp.int32, device=dev)
+    won = wp.zeros(m, dtype=wp.int32, device=dev)
+    args = [gathered["valid"], gathered["v10"], gathered["v11"], gathered["cap_top"],
+            gathered["cap_bot"], gathered["side"], gathered["arm_side"], gathered["arm_otop"],
+            gathered["arm_obot"], gathered["top"], gathered["bot"], vown, sown, bown]
+    wp.launch(reserve_i_device_kernel, dim=m, device=dev, inputs=args)
+    wp.launch(check_i_device_kernel, dim=m, device=dev, inputs=args + [won])
+    return won
+
+
+@wp.kernel
+def reserve_h_device_kernel(
+        valid: wp.array(dtype=wp.int32), tri_cand: wp.array(dtype=wp.int32),
+        cap_top: wp.array(dtype=wp.int32), cap_bot: wp.array(dtype=wp.int32),
+        tri: wp.array2d(dtype=wp.int32), side: wp.array2d(dtype=wp.int32),
+        arm_side: wp.array2d(dtype=wp.int32), arm_otop: wp.array2d(dtype=wp.int32),
+        arm_obot: wp.array2d(dtype=wp.int32),
+        top: wp.array2d(dtype=wp.int32), bot: wp.array2d(dtype=wp.int32),
+        vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+        bown: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    if valid[i] == 0:
+        return
+    wp.atomic_min(sown, tri_cand[i], i)                  # the triangle itself joins the footprint
+    for k in range(3):
+        wp.atomic_min(vown, tri[i, k], i)
+        wp.atomic_min(vown, arm_otop[i, k], i)
+        wp.atomic_min(vown, arm_obot[i, k], i)
+        wp.atomic_min(sown, arm_side[i, k], i)
+        wp.atomic_min(sown, top[i, k], i)
+        wp.atomic_min(sown, bot[i, k], i)
+        wp.atomic_min(bown, side[i, k], i)
+    wp.atomic_min(bown, cap_top[i], i)
+    wp.atomic_min(bown, cap_bot[i], i)
+
+
+@wp.kernel
+def check_h_device_kernel(
+        valid: wp.array(dtype=wp.int32), tri_cand: wp.array(dtype=wp.int32),
+        cap_top: wp.array(dtype=wp.int32), cap_bot: wp.array(dtype=wp.int32),
+        tri: wp.array2d(dtype=wp.int32), side: wp.array2d(dtype=wp.int32),
+        arm_side: wp.array2d(dtype=wp.int32), arm_otop: wp.array2d(dtype=wp.int32),
+        arm_obot: wp.array2d(dtype=wp.int32),
+        top: wp.array2d(dtype=wp.int32), bot: wp.array2d(dtype=wp.int32),
+        vown: wp.array(dtype=wp.int32), sown: wp.array(dtype=wp.int32),
+        bown: wp.array(dtype=wp.int32), won: wp.array(dtype=wp.int32)):
+    i = wp.tid()
+    if valid[i] == 0:
+        won[i] = wp.int32(0)
+        return
+    w = wp.int32(1)
+    if sown[tri_cand[i]] != i:
+        w = wp.int32(0)
+    for k in range(3):
+        if vown[tri[i, k]] != i:
+            w = wp.int32(0)
+        if vown[arm_otop[i, k]] != i:
+            w = wp.int32(0)
+        if vown[arm_obot[i, k]] != i:
+            w = wp.int32(0)
+        if sown[arm_side[i, k]] != i:
+            w = wp.int32(0)
+        if sown[top[i, k]] != i:
+            w = wp.int32(0)
+        if sown[bot[i, k]] != i:
+            w = wp.int32(0)
+        if bown[side[i, k]] != i:
+            w = wp.int32(0)
+    if bown[cap_top[i]] != i:
+        w = wp.int32(0)
+    if bown[cap_bot[i]] != i:
+        w = wp.int32(0)
+    won[i] = w
+
+
+def reserve_h_won_device(g: dict, gathered: dict):
+    """One GPU reverse-reservation round over the [H]-gather's packed device arrays; return the
+    (M,) int32 `won` device mask. Mirror of reserve_i_won_device with the H footprint (the
+    triangle itself joins the surface footprint)."""
+    dev = g["device"]
+    m = int(gathered["valid"].shape[0])
+    if m == 0:
+        return wp.zeros(0, dtype=wp.int32, device=dev)
+    vown = wp.full(int(g["cap_v"]), m, dtype=wp.int32, device=dev)
+    sown = wp.full(int(g["cap_s"]), m, dtype=wp.int32, device=dev)
+    bown = wp.full(int(g["nb"]), m, dtype=wp.int32, device=dev)
+    won = wp.zeros(m, dtype=wp.int32, device=dev)
+    args = [gathered["valid"], gathered["tri_cand"], gathered["cap_top"], gathered["cap_bot"],
+            gathered["tri"], gathered["side"], gathered["arm_side"], gathered["arm_otop"],
+            gathered["arm_obot"], gathered["top"], gathered["bot"], vown, sown, bown]
+    wp.launch(reserve_h_device_kernel, dim=m, device=dev, inputs=args)
+    wp.launch(check_h_device_kernel, dim=m, device=dev, inputs=args + [won])
+    return won
+
+
+# ======================================================================================
 # C2 glue: the iterated independent-set I->H sweep, run on the GPU
 # ======================================================================================
 def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = None,
@@ -307,29 +490,48 @@ def reconnect_sweep_warp(g: dict, threshold: float, dl_th: Optional[float] = Non
 
 def reconnect_sweep_warp_device(g: dict, threshold: float, dl_th: Optional[float] = None,
                                 max_rounds: int = 64) -> Dict[str, object]:
-    """FULLY-ON-DEVICE forward I->H sweep: each round detects (GPU scan + GPU gather, with the
-    Condition-4 veto fused into the gather), reserves (C2a), and applies (C2b) -- with NO
-    PaddedMesh.from_warp(g). Only O(candidates) config data leaves the device per round (vs the
-    O(mesh) host copy + Python scan of reconnect_sweep_warp). There is no separate veto step (the
-    gather emits only legal configs). Same cascade/headroom caveats as reconnect_sweep_warp; like
-    it, round 1 matches the host-scan sweep by fingerprint, later rounds may pick a different (also
+    """FULLY-ON-DEVICE forward I->H sweep (Option A: device-resident). Each round:
+
+      1. DETECT  -- find_short_edges_warp: GPU one-thread-per-vertex scan; the only data that
+                    leaves the device is the small (M,2) candidate-edge list, in canonical
+                    (v10,v11)-ascending order (so the lowest-id-wins reservation is deterministic).
+                    M==0 -> EMPTY-STEP FAST PATH: skip the gather/reserve/apply entirely.
+      2. GATHER  -- gather_i_configs_warp: per-candidate [I]-neighbourhood + fused Condition-4 veto,
+                    emitting PACKED DEVICE ARRAYS (valid/caps/side/arms/top/bot). These stay on the
+                    device -- they are NOT round-tripped to host ICfgIdx objects.
+      3. RESERVE -- reserve_i_won_device: the C2a atomic lowest-id-wins reservation reads those
+                    device arrays directly (invalid rows neither reserve nor win). The ONLY host
+                    readback in the loop is the 1-value winner COUNT (won.sum()).
+      4. APPLY   -- apply_i_to_h_device_warp: every winner's count-changing surgery runs in
+                    parallel from the same device arrays, with no output readback.
+      5. ITERATE -- re-detect on the mutated device mesh; stop on no legal short edge / max_rounds.
+
+    Replaces the earlier per-candidate host round-trip (gather->ICfgIdx list->pack_footprints->
+    col/mat apply packing) -- ~12 device<->host syncs/round collapsed to ~2 -- with NO change to
+    the math: the footprint element set, the reservation selection, and the Okuda placement +
+    surgery are identical to the host-packed path, so round 1 stays fingerprint-equal to the
+    host-scan sweep (reconnect_sweep_warp) and the gated equivalence tests hold. Same
+    cascade/headroom caveats as reconnect_sweep_warp; later rounds may pick a different (also
     valid) batch as the device slot order diverges."""
     if dl_th is None:
         dl_th = threshold
+    dev = g["device"]
     total = 0
     round_sizes: List[int] = []
     rounds = 0
     while rounds < max_rounds:
-        sites = detect_short_edges_device(g, threshold)   # scan + gather + fused veto, no from_warp
-        sites.sort(key=lambda s: (s[0], s[1]))            # canonical order -> deterministic reservation
-        if not sites:
+        edges = find_short_edges_warp(g, threshold)       # (M,2) (v10,v11)-ascending; only host data
+        if len(edges) == 0:                               # empty-step fast path
             break
-        winners = reserve_independent_set_warp_g(g, sites)
-        if not winners:
+        gathered = gather_i_configs_warp(g, edges, device=dev)   # packed DEVICE arrays + fused veto
+        won = reserve_i_won_device(g, gathered)           # device won mask (skips invalid rows)
+        wp.synchronize_device(dev)
+        n_win = int(won.numpy().sum())                    # the loop's only readback: winner count
+        if n_win == 0:                                    # all candidates vetoed / lost -> done
             break
-        apply_i_to_h_batch_warp(g, winners, dl_th)
-        total += len(winners)
-        round_sizes.append(len(winners))
+        apply_i_to_h_device_warp(g, gathered, won, dl_th)  # parallel surgery from device arrays
+        total += n_win
+        round_sizes.append(n_win)
         rounds += 1
     return dict(total=total, rounds=rounds, round_sizes=round_sizes,
                 converged=(rounds < max_rounds))
@@ -374,26 +576,33 @@ def reconnect_sweep_h_to_i_warp(g: dict, threshold: float, dl_th: Optional[float
 
 def reconnect_sweep_h_to_i_warp_device(g: dict, threshold: float, dl_th: Optional[float] = None,
                                        max_rounds: int = 64) -> Dict[str, object]:
-    """FULLY-ON-DEVICE reverse H->I sweep (the mirror of reconnect_sweep_warp_device): each round
-    detects (GPU scan + GPU [H]-gather, Condition-4 veto fused), reserves (C2'), and applies
-    (h_to_i_batch_kernel) -- with NO PaddedMesh.from_warp(g). Only O(candidates) data leaves the
-    device per round. Same cascade/headroom caveats as reconnect_sweep_h_to_i_warp."""
+    """FULLY-ON-DEVICE reverse H->I sweep (Option A: device-resident; the mirror of
+    reconnect_sweep_warp_device). Each round: find_small_triangles_warp emits the small candidate
+    list in canonical (triangle-ascending) order; gather_h_configs_warp emits packed DEVICE arrays
+    (Condition-4 veto fused); reserve_h_won_device runs the C2' lowest-id-wins reservation on those
+    arrays (the only host readback is the winner count); apply_h_to_i_device_warp runs every
+    winner's H->I in parallel from the device arrays. No PaddedMesh.from_warp(g), no per-candidate
+    host round-trip. Math unchanged vs the host-packed path -> round 1 stays fingerprint-equal to
+    reconnect_sweep_h_to_i_warp. Same cascade/headroom caveats."""
     if dl_th is None:
         dl_th = threshold
+    dev = g["device"]
     total = 0
     round_sizes: List[int] = []
     rounds = 0
     while rounds < max_rounds:
-        sites = detect_small_triangles_device(g, threshold)   # scan + gather + fused veto, no from_warp
-        sites.sort(key=lambda s: s[0])                        # canonical order -> deterministic reservation
-        if not sites:
+        tris = find_small_triangles_warp(g, threshold)    # triangle-ascending; only host data
+        if len(tris) == 0:                                # empty-step fast path
             break
-        winners = reserve_h_independent_set_warp_g(g, sites)
-        if not winners:
+        gathered = gather_h_configs_warp(g, tris, device=dev)    # packed DEVICE arrays + fused veto
+        won = reserve_h_won_device(g, gathered)           # device won mask (skips invalid rows)
+        wp.synchronize_device(dev)
+        n_win = int(won.numpy().sum())                    # the loop's only readback: winner count
+        if n_win == 0:
             break
-        apply_h_to_i_batch_warp(g, winners, dl_th)
-        total += len(winners)
-        round_sizes.append(len(winners))
+        apply_h_to_i_device_warp(g, gathered, won, dl_th)  # parallel surgery from device arrays
+        total += n_win
+        round_sizes.append(n_win)
         rounds += 1
     return dict(total=total, rounds=rounds, round_sizes=round_sizes,
                 converged=(rounds < max_rounds))

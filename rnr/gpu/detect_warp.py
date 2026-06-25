@@ -159,66 +159,97 @@ def d_ring_neighbor(s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.
 @wp.kernel
 def scan_short_edges_kernel(
         vert_pos: wp.array(dtype=wp.vec3d), vert_alive: wp.array(dtype=wp.int32),
-        v2s: wp.array2d(dtype=wp.int32), v2s_len: wp.array(dtype=wp.int32),
+        surf_alive: wp.array(dtype=wp.int32),
         s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
-        s2b: wp.array2d(dtype=wp.int32), threshold: wp.float64,
+        threshold: wp.float64,
         out_v10: wp.array(dtype=wp.int32), out_v11: wp.array(dtype=wp.int32),
         out_count: wp.array(dtype=wp.int32)):
-    """One thread per vertex v. v emits edge (v, w) for each DISTINCT ring-neighbour w>v (alive,
-    len<threshold) -- the host find_short_edges trigger, where each edge is produced by its
-    SMALLER endpoint (v alive + interior/4-cell) so no cross-thread dedup is needed. The
-    w-dedup (a neighbour shared by several incident faces) is an O(k^2) scan over earlier
-    (surface, side) ring entries -- no per-thread scratch array."""
-    v = wp.tid()
-    if vert_alive[v] == 0:
+    """One thread per SURFACE. Emit each implicit edge (consecutive ring pair) with len<threshold,
+    canonicalized smaller-endpoint-first -- the cheap LENGTH half of the host find_short_edges
+    trigger. Implicit edges ARE consecutive ring pairs, so this finds the identical edge set the
+    per-vertex walk did, but reads s2v[s,:] CONTIGUOUSLY and needs no d_ring_pos ring-search.
+
+    WHY per-surface (profiled): the old per-vertex scan was the dominant per-step cost (~2.1 ms in
+    the dynamic loop even at quiescence) -- cheap warm (0.03 ms) but ~10x cold-cache-penalized,
+    because each (vertex, incident-surface, side) did a scattered d_ring_neighbor -> d_ring_pos ring
+    walk with no structural early-out. The per-surface form has the SAME contiguous access pattern
+    as compute_geometry_warp (which costs ~0.29 ms), so it is ~7x cheaper cold. Each edge is shared
+    by two surfaces -> emitted twice; the interior (4-cell) half is applied SEPARATELY
+    (filter_interior_short_edges_kernel, on the smaller endpoint); find_short_edges_warp dedups +
+    sorts on the host. Output (interior-filtered, deduped, sorted) is BYTE-IDENTICAL -> no gate
+    change. Output cap n_s*MAX_RING bounds the (<= one-per-ring-edge-per-surface) emission.
+
+    NB no minimum-image in the length: a sub-Lth edge is tiny (both endpoints same box image), so
+    the raw distance is exact for short edges -- matching the prior per-vertex scan."""
+    s = wp.tid()
+    if surf_alive[s] == 0:
         return
-    if d_vert_body_count(v2s, v2s_len, s2b, v) != 4:    # interior vertex only
-        return
-    L = v2s_len[v]
+    L = s2v_len[s]
     for i in range(L):
-        s = v2s[v, i]
-        for side in range(2):
-            w = d_ring_neighbor(s2v, s2v_len, s, v, side)
-            if w <= v:                                   # only the smaller endpoint emits
-                continue
-            if vert_alive[w] == 0:
-                continue
-            dup = wp.int32(0)                            # did w appear in an earlier ring entry?
-            for i2 in range(L):
-                s2 = v2s[v, i2]
-                for side2 in range(2):
-                    if (i2 < i) or (i2 == i and side2 < side):
-                        if d_ring_neighbor(s2v, s2v_len, s2, v, side2) == w:
-                            dup = wp.int32(1)
-            if dup == 1:
-                continue
-            if wp.length(vert_pos[v] - vert_pos[w]) < threshold:
-                idx = wp.atomic_add(out_count, 0, 1)
-                out_v10[idx] = v
-                out_v11[idx] = w
+        a = s2v[s, i]
+        b = s2v[s, (i + 1) % L]
+        v = a                                            # canonical: smaller endpoint = v10
+        w = b
+        if b < a:
+            v = b
+            w = a
+        if vert_alive[v] == 0 or vert_alive[w] == 0:
+            continue
+        if wp.length(vert_pos[v] - vert_pos[w]) < threshold:
+            idx = wp.atomic_add(out_count, 0, 1)
+            out_v10[idx] = v
+            out_v11[idx] = w
+
+
+@wp.kernel
+def filter_interior_short_edges_kernel(
+        cand_v10: wp.array(dtype=wp.int32),
+        v2s: wp.array2d(dtype=wp.int32), v2s_len: wp.array(dtype=wp.int32),
+        s2b: wp.array2d(dtype=wp.int32), keep: wp.array(dtype=wp.int32)):
+    """Per emitted candidate edge: keep iff its SMALLER endpoint (v10) is an interior 4-cell
+    vertex -- the find_short_edges interior filter, applied to the (few) candidates so the
+    O(L^2) d_vert_body_count stays OUT of the per-vertex scan kernel (occupancy). Mirrors the
+    host short_edge_trigger_host, which filters on the smaller endpoint's interiorness only."""
+    i = wp.tid()
+    if d_vert_body_count(v2s, v2s_len, s2b, cand_v10[i]) == 4:
+        keep[i] = wp.int32(1)
+    else:
+        keep[i] = wp.int32(0)
 
 
 def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     """GPU parallel Condition-2 trigger scan for [I] sites. Returns an (M,2) int32 array of
-    candidate short edges (v10, v11) sorted by (v10, v11), read straight from the device SoA
-    -- the O(mesh) work of find_short_edges_csr, now one thread per vertex on the GPU."""
+    candidate short edges (v10, v11) sorted by (v10, v11), interior-filtered + deduped, read
+    straight from the device SoA -- the O(mesh) work of find_short_edges_csr, now one thread per
+    SURFACE (cheap length trigger) + a per-candidate interior filter on the GPU."""
     dev = g["device"]
-    n_v = int(g["n_used"].numpy()[0])               # tiny readback (1 int, not O(mesh))
-    if n_v == 0:
+    n_s = int(g["n_used"].numpy()[1])               # tiny readback (live surfaces; per-surface scan)
+    if n_s == 0:
         return np.zeros((0, 2), np.int32)
-    cap = 2 * n_v * g["MAX_VS"]                      # safe bound: <= 2 ring entries / incident surf
+    cap = n_s * g["MAX_RING"]                        # safe bound: <= one emit per ring edge per surface
     out_v10 = wp.zeros(cap, dtype=wp.int32, device=dev)
     out_v11 = wp.zeros(cap, dtype=wp.int32, device=dev)
     count = wp.zeros(1, dtype=wp.int32, device=dev)
-    wp.launch(scan_short_edges_kernel, dim=n_v, device=dev, inputs=[
-        g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["s2v"], g["s2v_len"],
-        g["s2b"], wp.float64(threshold), out_v10, out_v11, count])
+    wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[     # cheap per-surface length trigger
+        g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
+        wp.float64(threshold), out_v10, out_v11, count])
     wp.synchronize_device(dev)
     k = int(count.numpy()[0])
-    v10 = out_v10.numpy()[:k]
-    v11 = out_v11.numpy()[:k]
-    order = np.lexsort((v11, v10))                   # canonical (v10, v11)-ascending order
-    return np.stack([v10[order], v11[order]], axis=1).astype(np.int32)
+    if k == 0:
+        return np.zeros((0, 2), np.int32)
+    keep = wp.zeros(k, dtype=wp.int32, device=dev)                       # interior filter, off-hot-path
+    wp.launch(filter_interior_short_edges_kernel, dim=k, device=dev,
+              inputs=[out_v10, g["v2s"], g["v2s_len"], g["s2b"], keep])
+    wp.synchronize_device(dev)
+    mask = keep.numpy().astype(bool)
+    v10 = out_v10[:k].numpy()[mask]                  # slice ON DEVICE first -> copy only k, not cap
+    v11 = out_v11[:k].numpy()[mask]
+    if v10.size == 0:
+        return np.zeros((0, 2), np.int32)
+    # np.unique(axis=0) both DEDUPS (the scan emits an edge once per incident face) and sorts rows
+    # lexicographically -> the exact canonical (v10,v11)-ascending interior-filtered deduped set the
+    # host trigger (find_short_edges_csr) produces. (Dedup + interior filter moved off the scan.)
+    return np.unique(np.stack([v10, v11], axis=1).astype(np.int32), axis=0)
 
 
 def short_edge_trigger_host(pm: PaddedMesh, threshold: float) -> Set[Tuple[int, int]]:
