@@ -9,15 +9,20 @@
 > diffusion as fp64 Warp kernels, composed into `engine.forward_step`, validated host==TF (float32),
 > GPU==host (fp64), a deterministic GPU trajectory == host to 9e-16, and a mixed IC that demixes
 > (3DVertVor cell sorting on the GPU). Full gate `pixi run test` → **127 passed** (79 GPU tests on the
-> RTX 5090). **2026-06-24 PM — 100k-step stability check (new `pixi run gpu-stability`) found the GPU
-> sort does NOT complete at paper scale (N=1728): an I→H reconnection leaves the new cap-cap triangle
-> with REVERSED winding → broken cell closure → wrong origin-dependent volume → balloon after ~1000
-> cumulative I→H. NOT dt/forces/regularizers (reconnect-OFF is rock-solid at N=2000). N≤128 OK for a
-> full 100k sort. ROOT CAUSE pinned, fix NOT yet landed (2 attempts ruled out); engine at green
-> baseline. See memory `gpu-rnr-scale-corruption` + session log below.** Other optional/post-plan:
-> batched multi-mesh stepping, a faster periodic-foam builder, hand-CUDA-in-fork. Plan + progress §10:
-> `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session log:
-> `docs/sessions/2026-06-24-2000-gpu-rnr-paperscale-stability-bug.md`.
+> RTX 5090). **2026-06-24 PM — paper-scale stability BUG FOUND then FIXED.** A cell ballooned once
+> cumulative I→H crossed ~1000. Root cause (refined): a face wound inconsistent with its `b1/b2`
+> breaks cell closure (`Σ sense·snorm≠0`) → wrong, origin-dependent volume → balloon. Two sources:
+> near-degenerate INITIAL foam faces (zero area ⇒ arbitrary winding) sitting just above `lth` so
+> H→I never collapses them (dominant); + occasional `b1/b2`-inconsistent I↔H surgery output. No
+> geometric per-face test detects mis-winding (it's topological). **FIX:** `orient_warp.orient_repair_warp`
+> (closure-residual ring-flip) after each sweep in `engine.forward_step`. **PAPER SCALE PASSES:**
+> n=10 (2000 cells) 100k steps STABLE, 6010 I→H, vol [0.90,1.05], het 0.497→0.447; `pixi run test`=127.
+> (`tvm`/3DVertVor never need this — they re-derive orientation topologically every reconnection via
+> `updatePolygonDirections`; our implicit ring+b1/b2 model loses the invariant.) See memory
+> `gpu-rnr-scale-corruption` (RESOLVED) + session log below.** Other optional/post-plan:
+> batched multi-mesh stepping, a faster periodic-foam builder (O(N²) setup ceiling), hand-CUDA-in-fork.
+> Plan + progress §10: `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session log:
+> `docs/sessions/2026-06-24-2345-gpu-rnr-winding-balloon-fixed.md`.
 
 ## Status — the Phase-2 goal is REPRODUCED ✅
 
