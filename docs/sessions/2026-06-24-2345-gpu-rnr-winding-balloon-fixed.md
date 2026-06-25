@@ -102,13 +102,26 @@ prior handoff `docs/sessions/2026-06-24-2000-gpu-rnr-paperscale-stability-bug.md
 restoring the per-face orientation invariant that `tvm`'s `updatePolygonDirections` maintains
 natively but our implicit (ring+b1/b2) model loses.
 
-**Priority-ordered next steps (all OPTIONAL — the core bug is closed):**
+**Priority-ordered next steps (core bug is closed; #1 is the RECOMMENDED robustness upgrade, rest optional):**
 
-1. **(C++-port faithfulness, nice-to-have)** Consider porting `tvm`'s `updatePolygonDirections`
-   edge-connectivity propagation (`tvm/Cell/Cell.cpp:49-209`) as the orientation mechanism instead
-   of the closure-residual flip — it's the "gold standard" topological derivation and is what the
-   eventual native C++ `MeshQuality` op should mirror. Our closure-residual version is correct +
-   more parallel; document the choice in the design doc §10 either way.
+1. **Implement `tvm`'s `updatePolygonDirections` to REPLACE the closure-residual flip — recommended
+   next step (robustness + C++-port faithfulness).** Our current `orient_repair_warp` is a *greedy*
+   closure descent: it's validated to round-off at paper scale (only 0–3 flips/step), but it relies
+   on the residual being dominated by individually-flippable faces, so it can *in principle* stall
+   on a cell with many simultaneously-inconsistent faces. `tvm`'s method (`tvm/Cell/Cell.cpp:49-209`,
+   called every reconnection at `Reconnection.cpp:111-114`) is **exact in one pass and topological**:
+   per cell, BFS-propagate orientation across shared edges (each edge is shared by exactly 2 of that
+   cell's faces) so the two faces traverse the shared edge in OPPOSITE directions, then flip the
+   whole cell if its signed volume is negative — re-deriving the unique consistent orientation
+   regardless of how many faces were wrong.
+   - **It does NOT need explicit Edge objects** (TF/our model has none): reconstruct the per-cell
+     edge→face adjacency from the vertex rings — an edge is a consecutive ring pair
+     `(s2v[s,i], s2v[s,i+1])`; build a per-cell map `frozenset{a,b} → [(face, direction)]`, then BFS.
+     ~O(faces·valence) per cell. This is the faithful reference for the eventual native C++
+     `MeshQuality` op (CLAUDE.md goal: harden into C++ later).
+   - Keep the cheap closure metric as a **post-condition assert** (closure ≈ round-off after the
+     pass). Validate: `gpu-stability --n 10 --steps 100000` still STABLE + `pixi run test` = 127.
+   - Document the choice (greedy-flip vs topological-propagation) in the design doc §10.
 2. **(Perf, prior handoff #3 — still open)** The **O(N²) foam builder** makes N=2000 SETUP take
    ~10 min (the 100k stepping itself is fast, ~5.6 ms/step). This is now the wall-clock bottleneck
    for paper-scale runs. Profile/optimize `_setup_unit_foam` (the TF-foam→CSR build) if you need to
