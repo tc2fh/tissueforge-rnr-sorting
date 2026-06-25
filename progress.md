@@ -9,11 +9,15 @@
 > diffusion as fp64 Warp kernels, composed into `engine.forward_step`, validated host==TF (float32),
 > GPU==host (fp64), a deterministic GPU trajectory == host to 9e-16, and a mixed IC that demixes
 > (3DVertVor cell sorting on the GPU). Full gate `pixi run test` → **127 passed** (79 GPU tests on the
-> RTX 5090). Next (optional, post-plan): **batched multi-mesh stepping** (kernels already run on a
-> disjoint-union SoA → the 18-sim Fig 1E/1F ensemble in ~one run), a 100k-step stability check (likely
-> re-add flat/convex), a faster periodic-foam builder, then hand-CUDA-in-fork. Plan + progress §10:
+> RTX 5090). **2026-06-24 PM — 100k-step stability check (new `pixi run gpu-stability`) found the GPU
+> sort does NOT complete at paper scale (N=1728): an I→H reconnection leaves the new cap-cap triangle
+> with REVERSED winding → broken cell closure → wrong origin-dependent volume → balloon after ~1000
+> cumulative I→H. NOT dt/forces/regularizers (reconnect-OFF is rock-solid at N=2000). N≤128 OK for a
+> full 100k sort. ROOT CAUSE pinned, fix NOT yet landed (2 attempts ruled out); engine at green
+> baseline. See memory `gpu-rnr-scale-corruption` + session log below.** Other optional/post-plan:
+> batched multi-mesh stepping, a faster periodic-foam builder, hand-CUDA-in-fork. Plan + progress §10:
 > `docs/2026-06-24_gpu-3d-vertex-model-exploration.md`; latest session log:
-> `docs/sessions/2026-06-24-1650-gpu-rnr-gate-e-physics-engine-sorting.md`.
+> `docs/sessions/2026-06-24-2000-gpu-rnr-paperscale-stability-bug.md`.
 
 ## Status — the Phase-2 goal is REPRODUCED ✅
 
