@@ -51,10 +51,16 @@ def forward_step(g: dict, phys: dict, params, dt: float, dr: float, seed: int, s
         ni, nh = ri["total"], rh["total"]
         if compact and (ni + nh) > 0:
             compact_warp(g)
-        # heal any b1/b2-inconsistent windings (near-degenerate initial faces + occasional
-        # surgery output) so every cell stays CLOSED and its divergence-theorem volume is
-        # correct -- without this the mesh balloons at scale (orient_warp / §6p).
-        orient_repair_warp(g)
+        # Heal any b1/b2-inconsistent windings so every cell stays CLOSED and its divergence-
+        # theorem volume is correct -- without this the mesh balloons at scale (orient_warp / §6p).
+        # Windings only go inconsistent from (a) the initial foam's near-degenerate faces and
+        # (b) reconnection surgery -- NOT the per-step integrate -- and orient_repair is idempotent
+        # (a no-op, but it pays a full geometry recompute, on a clean mesh). So run it after any
+        # reconnection, plus ONCE to heal the initial foam (`_healed_initial`). Skipping the
+        # per-step no-op orient on no-reconnection steps is bit-identical and saves ~0.38 ms/step.
+        if (ni + nh) > 0 or not g.get("_healed_initial", False):
+            orient_repair_warp(g)
+            g["_healed_initial"] = True
     nu = g["n_used"].numpy()
     return dict(i=ni, h=nh, nv=int(nu[0]), ns=int(nu[1]))
 

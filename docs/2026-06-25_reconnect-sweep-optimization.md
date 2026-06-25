@@ -71,27 +71,34 @@ runs on the smaller endpoint. `find_short_edges_warp` output stays **byte-identi
 
 **Result:** scan ~2.1 → ~1.0 ms in the dynamic loop; static `reconnect_sweep_warp_device` 2.07 → 0.98 ms.
 
-## Net result
-End-to-end `forward_step` at N=2000, σ=0.5, dt=0.01 (300-step phase profiles; the per-phase syncs
-inflate vs the real loop, which is faster):
-- **mid-sort step 10.06 → 3.68 ms/step (~2.7×)**; `recon_i` 7.70 → 1.44 ms.
-- **quiescent step 3.87 → 2.77 ms/step**; `recon_i` 2.10 → 1.04 ms.
-- Real 100k stability loop (pre-session): 9.09 ms/step → (this session) measured below.
+### 5. Gate `orient_repair` on reconnections (DONE) — ~0.3 ms/step, exact
+`orient_repair_warp` ran every interval step (`engine.py`) and pays a full `compute_geometry_warp`
+recompute (orient_warp.py:97) even though it is IDEMPOTENT — a no-op (0 flips, `s2v` unchanged) on a
+consistently-wound mesh. Windings only go inconsistent from (a) the initial foam's near-degenerate
+faces and (b) reconnection surgery — NOT the per-step integrate — so the per-step orient on
+no-reconnection steps was pure redundant cost (~0.3–0.38 ms). Gated it on `(ni+nh)>0` plus ONE initial
+heal (`_healed_initial` flag in `g`, fired at the end of the first step exactly where the old code's
+step-0 orient ran → same trajectory point). Skipping the no-op orients is **bit-identical**.
 
-All gates green (132-test gate; 79 GPU tests incl. round-1 fingerprint equivalence). 100k stability
-STABLE; before/after at matched 20k steps is BIT-IDENTICAL (het + reconnection counts) — pure perf.
+## Net result
+End-to-end `forward_step` at N=2000, σ=0.5, dt=0.01 (300-step phase profiles inflate vs the real loop):
+- **mid-sort step 10.06 → 3.68 ms/step**; `recon_i` 7.70 → 1.44 ms.
+- **quiescent step 3.87 → 2.77 ms/step** (pre orient-gating); `recon_i` 2.10 → 1.04 ms.
+- **Real 20k stability loop: 9.09 → 3.05 ms (per-surface) → 2.78 ms (orient-gated) — ~3.3×.** More at
+  quiescence, where every step skips orient. 100k STABLE; before/after at matched 20k is BIT-IDENTICAL
+  at every checkpoint (het + reconnection counts + volumes match to the last digit) — pure perf.
+
+All gates green (132-test gate; 79 GPU tests incl. round-1 fingerprint equivalence + engine forward-step).
 
 ## Remaining bottleneck + next levers (NOT done)
-`recon_i` is still the largest phase (~37–39%), now ~1 ms/step — the per-surface scan ran ~1×/step
-(plus per-round re-scans) and is still mildly cold-cache-bound. Further wins, in rough order:
+`recon_i` (the per-surface scan, ~1 ms/step, mildly cold-cache-bound) is the largest phase left; `force`
+(~0.6 ms, the 4 actors — real physics, not overhead) is next. Further wins, in rough order:
 1. **Skip the scan on quiescent steps.** Piggyback a global `min_edge` atomic-min onto
    `compute_geometry_warp` (already iterates every ring edge, ~free) and skip the I-sweep when
-   `min_edge >= Lth + margin`. Caveat: geometry is PRE-integrate, so it needs a conservative margin
+   `min_edge >= Lth + margin`. CAVEAT: geometry is PRE-integrate, so it needs a conservative margin
    (≥ max per-step displacement) to never miss a reconnection; a too-small margin delays a rare
    reconnection by 1 step (breaks the bit-identical trajectory). Faithfulness call — get buy-in.
+   This is the biggest remaining single win (~1 ms on the majority quiescent steps).
 2. **Dirty-region re-scan.** The sweep re-scans the WHOLE mesh after every applied round; only the
    reconnection neighbourhoods gain new short edges. Exact, but only helps multi-round (minority) steps.
-3. **Reduce `orient_repair` frequency** (0.37 ms/step, runs every interval step). Windings only change
-   on reconnection, so it is redundant on no-reconnection steps — BUT the initial foam has degenerate
-   windings it heals at startup, so gating on `(ni+nh)>0` needs the initial heal handled (e.g. fold
-   into the foam-cache build).
+3. **CUDA graphs / `force`-kernel fusion** — secondary; `force` is real work, low ROI.
