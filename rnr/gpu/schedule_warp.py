@@ -33,7 +33,7 @@ import warp as wp
 from .detect_warp import (detect_short_edges_hybrid, detect_small_triangles_hybrid,
                           find_short_edges_warp, find_small_triangles_warp)
 from .device_mesh import PaddedMesh
-from .gather_warp import gather_h_configs_warp, gather_i_configs_warp
+from .gather_warp import _ensure_gather_buf, gather_h_configs_warp, gather_i_configs_warp
 from .reconnect_csr import HCfgIdx, ICfgIdx
 from .reconnect_warp import (apply_h_to_i_batch_warp, apply_h_to_i_device_warp,
                             apply_i_to_h_batch_warp, apply_i_to_h_device_warp)
@@ -523,7 +523,8 @@ def reconnect_sweep_warp_device(g: dict, threshold: float, dl_th: Optional[float
         edges = find_short_edges_warp(g, threshold)       # (M,2) (v10,v11)-ascending; only host data
         if len(edges) == 0:                               # empty-step fast path
             break
-        gathered = gather_i_configs_warp(g, edges, device=dev)   # packed DEVICE arrays + fused veto
+        buf = _ensure_gather_buf(g, "_i_gather_buf", len(edges))  # reused scratch (no per-round alloc/fill)
+        gathered = gather_i_configs_warp(g, edges, device=dev, buf=buf)   # packed DEVICE arrays + fused veto
         won = reserve_i_won_device(g, gathered)           # device won mask (skips invalid rows)
         wp.synchronize_device(dev)
         n_win = int(won.numpy().sum())                    # the loop's only readback: winner count
@@ -594,7 +595,8 @@ def reconnect_sweep_h_to_i_warp_device(g: dict, threshold: float, dl_th: Optiona
         tris = find_small_triangles_warp(g, threshold)    # triangle-ascending; only host data
         if len(tris) == 0:                                # empty-step fast path
             break
-        gathered = gather_h_configs_warp(g, tris, device=dev)    # packed DEVICE arrays + fused veto
+        buf = _ensure_gather_buf(g, "_h_gather_buf", len(tris), with_tri=True)  # reused scratch
+        gathered = gather_h_configs_warp(g, tris, device=dev, buf=buf)    # packed DEVICE arrays + fused veto
         won = reserve_h_won_device(g, gathered)           # device won mask (skips invalid rows)
         wp.synchronize_device(dev)
         n_win = int(won.numpy().sum())                    # the loop's only readback: winner count

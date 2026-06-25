@@ -33,6 +33,31 @@ wp.init()
 
 
 # --------------------------------------------------------------------------------------
+# reusable gather scratch (perf): the device sweep calls the gather EVERY step (a short edge is
+# almost always present), and ~74% of each gather call was per-round alloc+fill of its 9-11 output
+# arrays (profiled). These buffers are allocated ONCE on `g` and reused across rounds/steps, grown
+# x2 on demand. Correctness: the kernel writes valid[i] for every LAUNCHED row (0..m-1), and the
+# reserve/apply read the other fields ONLY for valid rows -- so stale data in invalid rows or in
+# rows >= m (never launched, never returned -- the gather returns [:m] views) is never consumed.
+# --------------------------------------------------------------------------------------
+def _ensure_gather_buf(g: dict, key: str, m: int, with_tri: bool = False) -> dict:
+    """Get-or-grow the reusable int32 output buffers for a gather, stashed on g[key] (sized >= m)."""
+    buf = g.get(key)
+    if buf is not None and buf["cap"] >= m:
+        return buf
+    dev = g["device"]
+    cap = max(m, 256, (buf["cap"] * 2 if buf is not None else 0))
+    z1 = lambda: wp.zeros(cap, dtype=wp.int32, device=dev)
+    z2 = lambda: wp.zeros((cap, 3), dtype=wp.int32, device=dev)
+    buf = dict(cap=cap, valid=z1(), cap_top=z1(), cap_bot=z1(), side=z2(),
+               arm_side=z2(), arm_otop=z2(), arm_obot=z2(), top=z2(), bot=z2())
+    if with_tri:
+        buf["tri"] = z2()
+    g[key] = buf
+    return buf
+
+
+# --------------------------------------------------------------------------------------
 # small device adjacency predicates (read-only; mirror topology_csr helpers)
 # --------------------------------------------------------------------------------------
 @wp.func
@@ -215,20 +240,36 @@ def gather_i_kernel(
     out_valid[i] = 1
 
 
-def gather_i_configs_warp(g: dict, cand_edges: np.ndarray, device=None) -> dict:
+def gather_i_configs_warp(g: dict, cand_edges: np.ndarray, device=None, buf: dict = None) -> dict:
     """Run the device [I]-gather over candidate edges (an (M,2) int32 array of (v10,v11) from
     detect_warp.find_short_edges_warp). Returns a dict of device arrays:
     valid (M,), cap_top/cap_bot (M,), side (M,3), arm_side/arm_otop/arm_obot (M,3), top/bot (M,3),
     plus v10/v11 (M,). `valid==1` <=> host i_neighbourhood_csr returns a config AND i_to_h_veto_csr
-    passes. The packed arrays feed the reservation + apply kernels with no host round-trip."""
+    passes. The packed arrays feed the reservation + apply kernels with no host round-trip.
+
+    `buf` (perf): when given (a dict from _ensure_gather_buf sized >= M), the 9 output arrays are
+    REUSED from it -- no per-call alloc/fill, no end sync -- and the returned dict holds [:M] views.
+    The kernel sets valid[i] for every launched row, and reserve/apply read other fields only for
+    valid rows, so reuse is bit-identical (stale rows are never consumed). Omit `buf` (tests /
+    gather_*_to_list) for the standalone fresh-allocation path."""
     dev = g["device"] if device is None else device
     m = int(cand_edges.shape[0])
     a1 = lambda a: wp.array(np.ascontiguousarray(a), dtype=wp.int32, device=dev)
-    z1 = lambda: wp.zeros(max(m, 1), dtype=wp.int32, device=dev)
-    z2 = lambda: wp.full((max(m, 1), 3), -1, dtype=wp.int32, device=dev)
     cand = np.ascontiguousarray(cand_edges.reshape(-1, 2).astype(np.int32)) if m else np.zeros((1, 2), np.int32)
     c_v10 = a1(cand[:, 0])
     c_v11 = a1(cand[:, 1])
+    if buf is not None and m > 0:                       # reuse path (device sweep): no alloc/fill/sync
+        wp.launch(gather_i_kernel, dim=m, device=dev, inputs=[
+            g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"], g["s2v"], g["s2v_len"],
+            g["s2b"], g["b2s"], g["b2s_len"], c_v10, c_v11,
+            buf["valid"], buf["cap_top"], buf["cap_bot"], buf["side"],
+            buf["arm_side"], buf["arm_otop"], buf["arm_obot"], buf["top"], buf["bot"]])
+        return dict(v10=c_v10, v11=c_v11, valid=buf["valid"][:m], cap_top=buf["cap_top"][:m],
+                    cap_bot=buf["cap_bot"][:m], side=buf["side"][:m], arm_side=buf["arm_side"][:m],
+                    arm_otop=buf["arm_otop"][:m], arm_obot=buf["arm_obot"][:m],
+                    top=buf["top"][:m], bot=buf["bot"][:m])
+    z1 = lambda: wp.zeros(max(m, 1), dtype=wp.int32, device=dev)
+    z2 = lambda: wp.full((max(m, 1), 3), -1, dtype=wp.int32, device=dev)
     out = dict(v10=c_v10, v11=c_v11, valid=z1(), cap_top=z1(), cap_bot=z1(),
                side=z2(), arm_side=z2(), arm_otop=z2(), arm_obot=z2(), top=z2(), bot=z2())
     if m == 0:
@@ -477,16 +518,28 @@ def gather_h_kernel(
     out_valid[i] = 1
 
 
-def gather_h_configs_warp(g: dict, cand_tris: np.ndarray, device=None) -> dict:
+def gather_h_configs_warp(g: dict, cand_tris: np.ndarray, device=None, buf: dict = None) -> dict:
     """Run the device [H]-gather over candidate triangles (a 1-D int32 array of surface indices
     from detect_warp.find_small_triangles_warp). Returns device arrays mirroring the I-gather plus
-    `tri` (M,3). `valid==1` <=> host h_neighbourhood_csr returns a config AND h_to_i_veto_csr passes."""
+    `tri` (M,3). `valid==1` <=> host h_neighbourhood_csr returns a config AND h_to_i_veto_csr passes.
+    `buf` (perf): reuse the output arrays from a _ensure_gather_buf(..., with_tri=True) dict (see
+    gather_i_configs_warp) -- bit-identical, no per-call alloc/fill/sync; returns [:M] views."""
     dev = g["device"] if device is None else device
     m = int(len(cand_tris))
-    z1 = lambda: wp.zeros(max(m, 1), dtype=wp.int32, device=dev)
-    z2 = lambda: wp.full((max(m, 1), 3), -1, dtype=wp.int32, device=dev)
     tris = np.ascontiguousarray(np.asarray(cand_tris, np.int32).reshape(-1)) if m else np.zeros(1, np.int32)
     c_tri = wp.array(tris, dtype=wp.int32, device=dev)
+    if buf is not None and m > 0:                       # reuse path (device sweep): no alloc/fill/sync
+        wp.launch(gather_h_kernel, dim=m, device=dev, inputs=[
+            g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"], g["s2v"], g["s2v_len"],
+            g["s2b"], g["b2s"], g["b2s_len"], c_tri,
+            buf["valid"], buf["cap_top"], buf["cap_bot"], buf["tri"], buf["side"],
+            buf["arm_side"], buf["arm_otop"], buf["arm_obot"], buf["top"], buf["bot"]])
+        return dict(tri_cand=c_tri, valid=buf["valid"][:m], cap_top=buf["cap_top"][:m],
+                    cap_bot=buf["cap_bot"][:m], tri=buf["tri"][:m], side=buf["side"][:m],
+                    arm_side=buf["arm_side"][:m], arm_otop=buf["arm_otop"][:m],
+                    arm_obot=buf["arm_obot"][:m], top=buf["top"][:m], bot=buf["bot"][:m])
+    z1 = lambda: wp.zeros(max(m, 1), dtype=wp.int32, device=dev)
+    z2 = lambda: wp.full((max(m, 1), 3), -1, dtype=wp.int32, device=dev)
     out = dict(tri_cand=c_tri, valid=z1(), cap_top=z1(), cap_bot=z1(), tri=z2(), side=z2(),
                arm_side=z2(), arm_otop=z2(), arm_obot=z2(), top=z2(), bot=z2())
     if m == 0:
