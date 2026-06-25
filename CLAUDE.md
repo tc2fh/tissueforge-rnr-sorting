@@ -165,15 +165,20 @@ The PDF is the authority. Implement from these equations, not from `tvm` code.
   to the edge) of averaged directions to the six outer neighbors, and `L_max`
   normalizes the largest.
 
-## Environment (pixi — TissueForge is a conda package)
+## Environment (pixi — TissueForge built FROM SOURCE = our fork)
 
-Use **pixi** (not uv): TissueForge's binary is conda-only, so a conda-backed env is
-required. `uv`/pip can't pull it.
+Use **pixi** (not uv): the env needs conda-forge for the C++ toolchain + libs.
 
-- TissueForge install: `conda install -c conda-forge -c tissue-forge tissue-forge`
-  → in pixi, add channels `conda-forge` and `tissue-forge` and dependency `tissue-forge`.
-- On macOS, vertex-model rendering needs the windowing libs that ship with the conda
-  package; headless/batch runs are fine for the science.
+- **TissueForge is OUR FORK, compiled from source into the env prefix** (NOT the conda
+  release). pixi.toml intentionally has NO `tissue-forge` channel/dependency; `pixi run build-tf`
+  runs `build_tissue_forge_{linux,osx}.sh` (cmake + `ninja --target install` into
+  `.pixi/envs/default`). Edit `tissue-forge/source/...` → `pixi run build-tf` (incremental relink,
+  a few min) → `pixi run verify`. Branch `feat/native-rnr-reconnection`; build tree
+  `tissue-forge_build/`; runbook `tissue-forge_build_runbook.md`. (Historically TF was the
+  `conda install -c tissue-forge tissue-forge` binary — that's retired; from-source is what lets us
+  fix engine internals the Python/SWIG bindings can't reach.)
+- On macOS, vertex-model rendering needs the windowing libs that ship via conda-forge;
+  headless/batch runs are fine for the science.
 - **pyvoro** (initial Voronoi geometry) is **pip-only** and its C extension can fail
   to build on modern Python. The original `joe-jordan/pyvoro` is stale; `tvm`'s README
   uses the maintained fork **`pyvoro-mmalahe`**. Try `pyvoro-mmalahe` first via pixi's
@@ -255,9 +260,15 @@ Verify the env with a one-liner: `import tissue_forge as tf; tf.init()` then
   green earlier in the session and only non-test-affecting files — docs/`*.md`/memory, not
   `*.py`/`conftest`/`pixi.toml` — changed since; state the prior result instead). Stage
   selectively (never `git add -A`): the read-only
-  oracle repos (`tvm/`, `3DVertVor/`, `tissue-forge/`, `cellGPU/`, `VertAX/`,
-  `gpu_reference_papers/`) carry their own `.git` and must never be committed. Branch off `main`
-  first if on it. **Pushing still requires an explicit ask** — commit is authorized, push is not.
+  oracle repos (`tvm/`, `3DVertVor/`, `cellGPU/`, `VertAX/`, `gpu_reference_papers/`) carry their
+  own `.git` and must never be committed. Branch off `main` first if on it. **Pushing still requires
+  an explicit ask** — commit is authorized, push is not.
+- **`tissue-forge/` is now our ACTIVE fork, not a read-only oracle** (the env runs it built
+  from source — see below). Engine changes under `tissue-forge/source/...` are committed to the
+  **fork's OWN `.git`** (branch `feat/native-rnr-reconnection`), and still NEVER staged into the
+  workspace `rnr` repo. So at handoff there are potentially TWO commits: workspace (`rnr/…`, docs,
+  memory) and fork (engine). Confirm the fork commit at handoff if engine source changed; pushing
+  either repo still needs an explicit ask.
 
 ## Citations to keep handy
 - TissueForge: Sego et al. (2023), *Sci. Rep.* 13:17886, “General, open-source vertex

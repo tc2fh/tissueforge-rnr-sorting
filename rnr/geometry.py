@@ -293,7 +293,15 @@ def build_periodic_voronoi(points, box: Box, btype, stype,
             l2g.append(gi)
         cell_l2g.append(l2g)
 
-    vhandles = [tfv.Vertex.create(tf.FVector3(*map(float, p))) for p in gpos]
+    # BATCH-create all vertices in ONE call. Per-element `Vertex.create` goes through
+    # Mesh::allocateVertex, which exhausts a 100-slot free-list every TFMESHINV_INCR=100 verts
+    # and then calls Mesh::incrementVertices -- a realloc that COPIES the vertex vector and walks
+    # every surface + vertex to fix up the raw pointers (O(N) each). N/100 such reallocs => O(N^2)
+    # (profiled: 12.7 s / 35% of the n=20 build, exponent 2.08). The batch overload
+    # `Vertex.create(list[FVector3])` -> Mesh::allocateVertices -> a SINGLE incrementVertices(N)
+    # -> ~O(N). Bit-identical to the loop: allocateVertices pulls free ids 0,1,2,... in input
+    # order, so vhandles[i] has id i and position gpos[i] exactly as before.
+    vhandles = list(tfv.Vertex.create([tf.FVector3(*map(float, p)) for p in gpos]))
 
     # --- dedup faces by vertex SET; build shared surfaces + per-body surface lists -----
     # periodic mode: f['adjacent_cell'] is the neighbour SEED index directly (no ghost remap),
