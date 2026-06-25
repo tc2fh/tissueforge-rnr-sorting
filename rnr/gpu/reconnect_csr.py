@@ -102,12 +102,13 @@ def iconfig_to_indices(cfg, vid2i: Dict[int, int], sid2i: Dict[int, int],
 # --------------------------------------------------------------------------------------
 # I -> H : short edge (v10, v11) becomes a triangular face (mirror of reconnect.i_to_h)
 # --------------------------------------------------------------------------------------
-def i_to_h_csr(pm: PaddedMesh, cfg: ICfgIdx, dl_th: float) -> HCfgIdx:
+def i_to_h_csr(pm: PaddedMesh, cfg: ICfgIdx, dl_th: float, box=None) -> HCfgIdx:
     """Reconnect the short edge of `cfg` into a triangular face, in place on `pm`.
 
     Returns the post-state HCfgIdx (the new triangle + its neighbourhood, in indices) so
     the inverse h_to_i_csr can run without re-searching. Step numbering follows
-    reconnect.i_to_h exactly.
+    reconnect.i_to_h exactly. `box` (per-axis lengths, or None) is forwarded to the Okuda
+    placement for periodic minimum-image arithmetic; None = non-periodic (unchanged).
     """
     v10, v11 = cfg.v10, cfg.v11
 
@@ -115,7 +116,7 @@ def i_to_h_csr(pm: PaddedMesh, cfg: ICfgIdx, dl_th: float) -> HCfgIdx:
     outer_tops = [pm.vert_pos[a.outer_top] for a in cfg.arms]
     outer_bots = [pm.vert_pos[a.outer_bot] for a in cfg.arms]
     positions = place_i_to_h_xyz(pm.vert_pos[v10], pm.vert_pos[v11],
-                                 outer_tops, outer_bots, dl_th)
+                                 outer_tops, outer_bots, dl_th, box=box)
     tri = [pm.alloc_vertex(positions[k]) for k in range(3)]    # tri[k] for arm k
     arm_by_outer_top = {a.outer_top: k for k, a in enumerate(cfg.arms)}
     arm_by_outer_bot = {a.outer_bot: k for k, a in enumerate(cfg.arms)}
@@ -166,12 +167,14 @@ def i_to_h_csr(pm: PaddedMesh, cfg: ICfgIdx, dl_th: float) -> HCfgIdx:
 # --------------------------------------------------------------------------------------
 # H -> I : triangular face collapses back to a short edge (mirror of reconnect.h_to_i)
 # --------------------------------------------------------------------------------------
-def h_to_i_csr(pm: PaddedMesh, cfg: HCfgIdx, dl_th: float):
+def h_to_i_csr(pm: PaddedMesh, cfg: HCfgIdx, dl_th: float, box=None):
     """Collapse the triangular face of `cfg` back into a short edge. Returns the two
-    recovered edge-vertex indices (nv10 toward cap_top, nv11 toward cap_bot)."""
+    recovered edge-vertex indices (nv10 toward cap_top, nv11 toward cap_bot). `box` (per-axis
+    lengths, or None) is forwarded to the Okuda placement for periodic minimum-image
+    arithmetic; None = non-periodic (unchanged)."""
     tri_pts = [pm.vert_pos[a.tri_vertex] for a in cfg.arms]
     outer_tops = [pm.vert_pos[a.outer_top] for a in cfg.arms]
-    p10, p11 = place_h_to_i_xyz(tri_pts, outer_tops, dl_th)
+    p10, p11 = place_h_to_i_xyz(tri_pts, outer_tops, dl_th, box=box)
     nv10 = pm.alloc_vertex(p10)        # cap_top-side recovered vertex
     nv11 = pm.alloc_vertex(p11)        # cap_bot-side recovered vertex
     tri_ids = set(cfg.tri_verts)

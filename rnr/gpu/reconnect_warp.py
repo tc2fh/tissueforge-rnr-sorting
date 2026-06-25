@@ -25,8 +25,20 @@ import numpy as np
 import warp as wp
 
 from .reconnect_csr import HArmIdx, HCfgIdx, ICfgIdx
+# periodic helpers reused by the Okuda placement (cross-module @wp.func MUST be imported into
+# this module's namespace or the kernels fail to compile -- see design doc §10 Warp gotcha).
+from .physics_warp import d_minimg, d_wrapbox
 
 wp.init()
+
+
+def _box_of(g: dict):
+    """The periodic box as a wp.vec3d for the placement kernels. A mesh with no box (the local
+    round-trip / fingerprint test meshes) yields a zero vec3d, for which d_minimg / d_wrapbox
+    are no-ops -- so placement falls back to the exact non-periodic arithmetic (and the GPU
+    result still matches the box=None CPU reference, keeping those gates green)."""
+    b = g.get("box")
+    return b if b is not None else wp.vec3d(0.0, 0.0, 0.0)
 
 
 # ======================================================================================
@@ -185,7 +197,7 @@ def i_to_h_kernel(
         s2b: wp.array2d(dtype=wp.int32),
         b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
         n_used: wp.array(dtype=wp.int32),
-        v10: int, v11: int, cap_top: int, cap_bot: int, dl_th: wp.float64,
+        v10: int, v11: int, cap_top: int, cap_bot: int, dl_th: wp.float64, box: wp.vec3d,
         arm_side: wp.array(dtype=wp.int32), arm_otop: wp.array(dtype=wp.int32),
         arm_obot: wp.array(dtype=wp.int32),
         top_faces: wp.array(dtype=wp.int32), bot_faces: wp.array(dtype=wp.int32),
@@ -198,24 +210,25 @@ def i_to_h_kernel(
     tri1 = v0 + 1
     tri2 = v0 + 2
 
-    # ---- Okuda Appendix-1 placement (fp64) ---------------------------------------------
+    # ---- Okuda Appendix-1 placement (fp64, periodic minimum-image; box=0 -> non-periodic) -
     p10 = vert_pos[v10]
     p11 = vert_pos[v11]
-    r0 = wp.float64(0.5) * (p10 + p11)
-    uT = safe_unit(p10 - p11)
-    w0 = wp.float64(0.5) * (safe_unit(vert_pos[arm_otop[0]] - r0) + safe_unit(vert_pos[arm_obot[0]] - r0))
+    d = d_minimg(p11 - p10, box)
+    r0 = p10 + wp.float64(0.5) * d
+    uT = safe_unit(-d)
+    w0 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[arm_otop[0]] - r0, box)) + safe_unit(d_minimg(vert_pos[arm_obot[0]] - r0, box)))
     vp0 = w0 - wp.dot(w0, uT) * uT
-    w1 = wp.float64(0.5) * (safe_unit(vert_pos[arm_otop[1]] - r0) + safe_unit(vert_pos[arm_obot[1]] - r0))
+    w1 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[arm_otop[1]] - r0, box)) + safe_unit(d_minimg(vert_pos[arm_obot[1]] - r0, box)))
     vp1 = w1 - wp.dot(w1, uT) * uT
-    w2 = wp.float64(0.5) * (safe_unit(vert_pos[arm_otop[2]] - r0) + safe_unit(vert_pos[arm_obot[2]] - r0))
+    w2 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[arm_otop[2]] - r0, box)) + safe_unit(d_minimg(vert_pos[arm_obot[2]] - r0, box)))
     vp2 = w2 - wp.dot(w2, uT) * uT
     lmax = wp.max(wp.length(vp0 - vp1), wp.max(wp.length(vp0 - vp2), wp.length(vp1 - vp2)))
     if lmax == wp.float64(0.0):
         lmax = wp.float64(1.0)
     sc = dl_th / lmax
-    vert_pos[tri0] = r0 + sc * vp0
-    vert_pos[tri1] = r0 + sc * vp1
-    vert_pos[tri2] = r0 + sc * vp2
+    vert_pos[tri0] = d_wrapbox(r0 + sc * vp0, box)
+    vert_pos[tri1] = d_wrapbox(r0 + sc * vp1, box)
+    vert_pos[tri2] = d_wrapbox(r0 + sc * vp2, box)
     vert_alive[tri0] = 1
     v2s_len[tri0] = 0
     vert_alive[tri1] = 1
@@ -291,29 +304,31 @@ def h_to_i_kernel(
         s2b: wp.array2d(dtype=wp.int32),
         b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
         n_used: wp.array(dtype=wp.int32),
-        triangle: int, cap_top: int, cap_bot: int, dl_th: wp.float64,
+        triangle: int, cap_top: int, cap_bot: int, dl_th: wp.float64, box: wp.vec3d,
         tri_verts: wp.array(dtype=wp.int32),
         arm_side: wp.array(dtype=wp.int32), arm_otop: wp.array(dtype=wp.int32),
         arm_obot: wp.array(dtype=wp.int32),
         top_faces: wp.array(dtype=wp.int32), bot_faces: wp.array(dtype=wp.int32),
         out_nv: wp.array(dtype=wp.int32)):
 
-    # ---- Okuda Eqs. 42-45 placement (fp64) ---------------------------------------------
+    # ---- Okuda Eqs. 42-45 placement (fp64, periodic minimum-image; box=0 -> non-periodic) -
     p0 = vert_pos[tri_verts[0]]
     p1 = vert_pos[tri_verts[1]]
     p2 = vert_pos[tri_verts[2]]
-    r0 = (p0 + p1 + p2) / wp.float64(3.0)
-    nrm = safe_unit(wp.cross(p1 - p0, p2 - p0))
-    tm = (vert_pos[arm_otop[0]] + vert_pos[arm_otop[1]] + vert_pos[arm_otop[2]]) / wp.float64(3.0)
-    if wp.dot(tm - r0, nrm) < wp.float64(0.0):
+    d1 = d_minimg(p1 - p0, box)
+    d2 = d_minimg(p2 - p0, box)
+    r0 = p0 + (d1 + d2) / wp.float64(3.0)
+    nrm = safe_unit(wp.cross(d1, d2))
+    tmr = (d_minimg(vert_pos[arm_otop[0]] - r0, box) + d_minimg(vert_pos[arm_otop[1]] - r0, box) + d_minimg(vert_pos[arm_otop[2]] - r0, box)) / wp.float64(3.0)
+    if wp.dot(tmr, nrm) < wp.float64(0.0):
         nrm = -nrm
     half = wp.float64(0.5) * dl_th
 
     v0 = wp.atomic_add(n_used, 0, 2)
     nv10 = v0
     nv11 = v0 + 1
-    vert_pos[nv10] = r0 + half * nrm
-    vert_pos[nv11] = r0 - half * nrm
+    vert_pos[nv10] = d_wrapbox(r0 + half * nrm, box)
+    vert_pos[nv11] = d_wrapbox(r0 - half * nrm, box)
     vert_alive[nv10] = 1
     v2s_len[nv10] = 0
     vert_alive[nv11] = 1
@@ -391,7 +406,7 @@ def i_to_h_warp(g: dict, cfg: ICfgIdx, dl_th: float) -> HCfgIdx:
     wp.launch(i_to_h_kernel, dim=1, device=dev, inputs=[
         g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
         g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"],
-        int(cfg.v10), int(cfg.v11), int(cfg.cap_top), int(cfg.cap_bot), float(dl_th),
+        int(cfg.v10), int(cfg.v11), int(cfg.cap_top), int(cfg.cap_bot), float(dl_th), _box_of(g),
         arm_side, arm_otop, arm_obot, topf, botf, out_tri, out_T])
     wp.synchronize_device(dev)
     tri = [int(x) for x in out_tri.numpy()]
@@ -417,7 +432,7 @@ def h_to_i_warp(g: dict, cfg: HCfgIdx, dl_th: float):
     wp.launch(h_to_i_kernel, dim=1, device=dev, inputs=[
         g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
         g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"],
-        int(cfg.triangle), int(cfg.cap_top), int(cfg.cap_bot), float(dl_th),
+        int(cfg.triangle), int(cfg.cap_top), int(cfg.cap_bot), float(dl_th), _box_of(g),
         tri_verts, arm_side, arm_otop, arm_obot, topf, botf, out_nv])
     wp.synchronize_device(dev)
     nv = out_nv.numpy()
@@ -435,7 +450,7 @@ def i_to_h_batch_kernel(
         s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
         s2b: wp.array2d(dtype=wp.int32),
         b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
-        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64,
+        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64, box: wp.vec3d,
         c_v10: wp.array(dtype=wp.int32), c_v11: wp.array(dtype=wp.int32),
         c_cap_top: wp.array(dtype=wp.int32), c_cap_bot: wp.array(dtype=wp.int32),
         c_arm_side: wp.array2d(dtype=wp.int32), c_arm_otop: wp.array2d(dtype=wp.int32),
@@ -456,24 +471,25 @@ def i_to_h_batch_kernel(
     v0 = wp.atomic_add(n_used, 0, 3)
     sT = wp.atomic_add(n_used, 1, 1)
 
-    # ---- placement (fp64) --------------------------------------------------------------
+    # ---- placement (fp64, periodic minimum-image; box=0 -> non-periodic) ----------------
     p10 = vert_pos[v10]
     p11 = vert_pos[v11]
-    r0 = wp.float64(0.5) * (p10 + p11)
-    uT = safe_unit(p10 - p11)
-    w0 = wp.float64(0.5) * (safe_unit(vert_pos[c_arm_otop[i, 0]] - r0) + safe_unit(vert_pos[c_arm_obot[i, 0]] - r0))
+    d = d_minimg(p11 - p10, box)
+    r0 = p10 + wp.float64(0.5) * d
+    uT = safe_unit(-d)
+    w0 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 0]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 0]] - r0, box)))
     vp0 = w0 - wp.dot(w0, uT) * uT
-    w1 = wp.float64(0.5) * (safe_unit(vert_pos[c_arm_otop[i, 1]] - r0) + safe_unit(vert_pos[c_arm_obot[i, 1]] - r0))
+    w1 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 1]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 1]] - r0, box)))
     vp1 = w1 - wp.dot(w1, uT) * uT
-    w2 = wp.float64(0.5) * (safe_unit(vert_pos[c_arm_otop[i, 2]] - r0) + safe_unit(vert_pos[c_arm_obot[i, 2]] - r0))
+    w2 = wp.float64(0.5) * (safe_unit(d_minimg(vert_pos[c_arm_otop[i, 2]] - r0, box)) + safe_unit(d_minimg(vert_pos[c_arm_obot[i, 2]] - r0, box)))
     vp2 = w2 - wp.dot(w2, uT) * uT
     lmax = wp.max(wp.length(vp0 - vp1), wp.max(wp.length(vp0 - vp2), wp.length(vp1 - vp2)))
     if lmax == wp.float64(0.0):
         lmax = wp.float64(1.0)
     sc = dl_th / lmax
-    vert_pos[v0] = r0 + sc * vp0
-    vert_pos[v0 + 1] = r0 + sc * vp1
-    vert_pos[v0 + 2] = r0 + sc * vp2
+    vert_pos[v0] = d_wrapbox(r0 + sc * vp0, box)
+    vert_pos[v0 + 1] = d_wrapbox(r0 + sc * vp1, box)
+    vert_pos[v0 + 2] = d_wrapbox(r0 + sc * vp2, box)
     vert_alive[v0] = 1
     v2s_len[v0] = 0
     vert_alive[v0 + 1] = 1
@@ -571,7 +587,7 @@ def apply_i_to_h_batch_warp(g: dict, batch, dl_th: float):
     out_T = wp.zeros(n, dtype=wp.int32, device=dev)
     wp.launch(i_to_h_batch_kernel, dim=n, device=dev, inputs=[
         g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
-        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th),
+        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th), _box_of(g),
         c_v10, c_v11, c_cap_top, c_cap_bot, c_arm_side, c_arm_otop, c_arm_obot,
         c_top, c_bot, out_tri, out_T])
     wp.synchronize_device(dev)
@@ -599,7 +615,7 @@ def h_to_i_batch_kernel(
         s2v: wp.array2d(dtype=wp.int32), s2v_len: wp.array(dtype=wp.int32),
         s2b: wp.array2d(dtype=wp.int32),
         b2s: wp.array2d(dtype=wp.int32), b2s_len: wp.array(dtype=wp.int32),
-        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64,
+        n_used: wp.array(dtype=wp.int32), dl_th: wp.float64, box: wp.vec3d,
         c_triangle: wp.array(dtype=wp.int32),
         c_cap_top: wp.array(dtype=wp.int32), c_cap_bot: wp.array(dtype=wp.int32),
         c_tri_verts: wp.array2d(dtype=wp.int32),
@@ -616,15 +632,17 @@ def h_to_i_batch_kernel(
     cap_top = c_cap_top[i]
     cap_bot = c_cap_bot[i]
 
-    # ---- placement (fp64) --------------------------------------------------------------
+    # ---- placement (fp64, periodic minimum-image; box=0 -> non-periodic) ----------------
     p0 = vert_pos[c_tri_verts[i, 0]]
     p1 = vert_pos[c_tri_verts[i, 1]]
     p2 = vert_pos[c_tri_verts[i, 2]]
-    r0 = (p0 + p1 + p2) / wp.float64(3.0)
-    nrm = safe_unit(wp.cross(p1 - p0, p2 - p0))
-    tm = (vert_pos[c_arm_otop[i, 0]] + vert_pos[c_arm_otop[i, 1]]
-          + vert_pos[c_arm_otop[i, 2]]) / wp.float64(3.0)
-    if wp.dot(tm - r0, nrm) < wp.float64(0.0):
+    d1 = d_minimg(p1 - p0, box)
+    d2 = d_minimg(p2 - p0, box)
+    r0 = p0 + (d1 + d2) / wp.float64(3.0)
+    nrm = safe_unit(wp.cross(d1, d2))
+    tmr = (d_minimg(vert_pos[c_arm_otop[i, 0]] - r0, box) + d_minimg(vert_pos[c_arm_otop[i, 1]] - r0, box)
+           + d_minimg(vert_pos[c_arm_otop[i, 2]] - r0, box)) / wp.float64(3.0)
+    if wp.dot(tmr, nrm) < wp.float64(0.0):
         nrm = -nrm
     half = wp.float64(0.5) * dl_th
 
@@ -632,8 +650,8 @@ def h_to_i_batch_kernel(
     v0 = wp.atomic_add(n_used, 0, 2)
     nv10 = v0
     nv11 = v0 + 1
-    vert_pos[nv10] = r0 + half * nrm
-    vert_pos[nv11] = r0 - half * nrm
+    vert_pos[nv10] = d_wrapbox(r0 + half * nrm, box)
+    vert_pos[nv11] = d_wrapbox(r0 - half * nrm, box)
     vert_alive[nv10] = 1
     v2s_len[nv10] = 0
     vert_alive[nv11] = 1
@@ -713,7 +731,7 @@ def apply_h_to_i_batch_warp(g: dict, batch, dl_th: float):
     out_nv = wp.zeros((n, 2), dtype=wp.int32, device=dev)
     wp.launch(h_to_i_batch_kernel, dim=n, device=dev, inputs=[
         g["vert_pos"], g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"],
-        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th),
+        g["s2v"], g["s2v_len"], g["s2b"], g["b2s"], g["b2s_len"], g["n_used"], float(dl_th), _box_of(g),
         c_triangle, c_cap_top, c_cap_bot, c_tri_verts, c_arm_side, c_arm_otop, c_arm_obot,
         c_top, c_bot, out_nv])
     wp.synchronize_device(dev)
@@ -746,6 +764,31 @@ def _place_itoh_f64(P: wp.array(dtype=wp.vec3d), dl_th: wp.float64,
     out[2] = r0 + sc * vp2
 
 
+@wp.kernel
+def _place_itoh_f64_box(P: wp.array(dtype=wp.vec3d), dl_th: wp.float64, box: wp.vec3d,
+                        out: wp.array(dtype=wp.vec3d)):
+    """The PRODUCTION I->H placement (periodic minimum-image), isolated for the parity test:
+    must equal reconnect.place_i_to_h_xyz(..., box) and the i_to_h kernels' inline placement."""
+    p10 = P[0]
+    p11 = P[1]
+    d = d_minimg(p11 - p10, box)
+    r0 = p10 + wp.float64(0.5) * d
+    uT = safe_unit(-d)
+    w0 = wp.float64(0.5) * (safe_unit(d_minimg(P[2] - r0, box)) + safe_unit(d_minimg(P[5] - r0, box)))
+    vp0 = w0 - wp.dot(w0, uT) * uT
+    w1 = wp.float64(0.5) * (safe_unit(d_minimg(P[3] - r0, box)) + safe_unit(d_minimg(P[6] - r0, box)))
+    vp1 = w1 - wp.dot(w1, uT) * uT
+    w2 = wp.float64(0.5) * (safe_unit(d_minimg(P[4] - r0, box)) + safe_unit(d_minimg(P[7] - r0, box)))
+    vp2 = w2 - wp.dot(w2, uT) * uT
+    lmax = wp.max(wp.length(vp0 - vp1), wp.max(wp.length(vp0 - vp2), wp.length(vp1 - vp2)))
+    if lmax == wp.float64(0.0):
+        lmax = wp.float64(1.0)
+    sc = dl_th / lmax
+    out[0] = d_wrapbox(r0 + sc * vp0, box)
+    out[1] = d_wrapbox(r0 + sc * vp1, box)
+    out[2] = d_wrapbox(r0 + sc * vp2, box)
+
+
 @wp.func
 def safe_unit_f32(a: wp.vec3) -> wp.vec3:
     n = wp.length(a)
@@ -776,10 +819,14 @@ def _place_itoh_f32(P: wp.array(dtype=wp.vec3), dl_th: wp.float32,
     out[2] = r0 + sc * vp2
 
 
-def probe_placement_precision(p10, p11, outer_tops, outer_bots, dl_th, device=None):
+def probe_placement_precision(p10, p11, outer_tops, outer_bots, dl_th, device=None, box=None):
     """Compute the I->H triangle placement on-device in fp64 and fp32; return both plus
     the numpy fp64 oracle (reconnect.place_i_to_h_xyz). Lets the test report the fp32 drift
-    that motivates the fp64 choice for the reversible RNR path."""
+    that motivates the fp64 choice for the reversible RNR path.
+
+    If `box` (per-axis lengths) is given, ALSO run the periodic min-image placement on-device
+    and the matching CPU oracle, adding `gpu_f64_box` / `oracle_box` to the result (the
+    GPU==CPU periodic parity check). `box=None` leaves the original non-periodic output."""
     from ..reconnect import place_i_to_h_xyz
     if device is None:
         cuda = [d for d in wp.get_devices() if d.is_cuda]
@@ -796,6 +843,17 @@ def probe_placement_precision(p10, p11, outer_tops, outer_bots, dl_th, device=No
     oracle = np.array(place_i_to_h_xyz(np.array(p10), np.array(p11),
                                        [np.array(t) for t in outer_tops],
                                        [np.array(b) for b in outer_bots], dl_th))
-    return dict(oracle=oracle,
-                gpu_f64=out64.numpy().reshape(3, 3),
-                gpu_f32=out32.numpy().reshape(3, 3).astype(np.float64))
+    res = dict(oracle=oracle,
+               gpu_f64=out64.numpy().reshape(3, 3),
+               gpu_f32=out32.numpy().reshape(3, 3).astype(np.float64))
+    if box is not None:
+        bx = np.asarray(box, float)
+        outb = wp.zeros(3, dtype=wp.vec3d, device=device)
+        wp.launch(_place_itoh_f64_box, dim=1, device=device,
+                  inputs=[P64, float(dl_th), wp.vec3d(float(bx[0]), float(bx[1]), float(bx[2])), outb])
+        wp.synchronize_device(device)
+        res["gpu_f64_box"] = outb.numpy().reshape(3, 3)
+        res["oracle_box"] = np.array(place_i_to_h_xyz(np.array(p10), np.array(p11),
+                                     [np.array(t) for t in outer_tops],
+                                     [np.array(b) for b in outer_bots], dl_th, box=bx))
+    return res

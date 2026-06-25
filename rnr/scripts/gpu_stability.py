@@ -85,6 +85,8 @@ def main():
                     help="degeneration bound: fail if any cell volume leaves [v0/f, f*v0] "
                          "(a stiff K_V=10 foam holds V near V0; f=20 flags a ballooned/collapsed cell)")
     ap.add_argument("--headroom", type=int, default=4000, help="vertex/surface slot capacity")
+    ap.add_argument("--rebuild-foam", action="store_true",
+                    help="ignore any cached foam and rebuild it de novo (then overwrite the cache)")
     ap.add_argument("--csv", default="", help="optional path to dump the audit timeline")
     ap.add_argument("--stop-on-fail", action="store_true", default=True,
                     help="halt at the first hard failure (default on)")
@@ -104,15 +106,24 @@ def main():
         sys.exit(2)
     dev = cuda[0]
 
-    # mirror conftest.vsolver / gpu_csr_demo so the foam is identical to the validated one
-    tf.init(windowless=True, dim=[60., 60., 60.], cutoff=5.0, dt=0.001)
-    tfv.init()
-    tfv.MeshSolver.get().get_mesh().quality = None
+    # Build-once / load-many: the unit-cell foam is cached to disk (foam_cache). On a cache HIT
+    # we load the saved geometry and skip the TF foam builder -- AND TF init -- entirely; on a
+    # MISS we init TF and build de novo (then save). The build half is the VERBATIM Gate-E setup
+    # (TF foam -> CSR -> unit scale); upload_unit_foam is the shared device half.
+    from rnr.gpu.foam_cache import load_or_build
 
-    # the VERBATIM Gate-E foam setup (TF foam -> CSR -> unit scale -> GPU upload)
-    from rnr.tests.test_gpu_engine import _setup_unit_foam
-    g, phys, body_type, box, v0, a0 = _setup_unit_foam(dev, n=args.n, headroom=args.headroom,
-                                                       ic=args.ic)
+    def _build_host():
+        # only runs on a cache miss -- defer the (slow) TF init here so a hit needs no TF at all.
+        # mirrors conftest.vsolver / gpu_csr_demo so the foam is identical to the validated one
+        tf.init(windowless=True, dim=[60., 60., 60.], cutoff=5.0, dt=0.001)
+        tfv.init()
+        tfv.MeshSolver.get().get_mesh().quality = None
+        from rnr.tests.test_gpu_engine import _build_unit_foam_host
+        return _build_unit_foam_host(n=args.n, headroom=args.headroom, ic=args.ic)
+
+    g, phys, body_type, box, v0, a0 = load_or_build(
+        dev, n=args.n, ic=args.ic, headroom=args.headroom,
+        build_host_fn=_build_host, rebuild=args.rebuild_foam)
     params = P.PhysParams(box=box, kv=10.0, v0=v0, ka=1.0, a0=a0,
                           sigma=args.sigma, v_active=args.v_active)
     cap_v = int(g["cap_v"])

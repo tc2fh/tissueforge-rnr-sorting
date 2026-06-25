@@ -50,6 +50,26 @@ def _unit(a: np.ndarray) -> np.ndarray:
     return a / n if n > 0 else a
 
 
+def _minimg(d: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Minimum-image displacement (matches physics_csr.minimg / physics_warp.d_minimg:
+    d - L*round(d/L)). A non-positive box component leaves that axis unwrapped."""
+    out = np.asarray(d, float).copy()
+    for k in range(3):
+        if box[k] > 0:
+            out[k] = out[k] - box[k] * np.round(out[k] / box[k])
+    return out
+
+
+def _wrapbox(p: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Wrap a position into [0, L) per axis (matches physics_warp.d_wrapbox: p - L*floor(p/L)).
+    A non-positive box component leaves that axis unwrapped."""
+    out = np.asarray(p, float).copy()
+    for k in range(3):
+        if box[k] > 0:
+            out[k] = out[k] - box[k] * np.floor(out[k] / box[k])
+    return out
+
+
 # --------------------------------------------------------------------------------------
 # low-level surgery primitives (maintain BOTH sides of each adjacency; verified recipe)
 # --------------------------------------------------------------------------------------
@@ -106,18 +126,33 @@ def _refresh(surfaces=(), bodies=()) -> None:
 # the GPU round-trip. The cfg-based wrappers below just gather positions and delegate.
 def place_i_to_h_xyz(p10: np.ndarray, p11: np.ndarray,
                      outer_tops: List[np.ndarray], outer_bots: List[np.ndarray],
-                     dl_th: float) -> List[np.ndarray]:
+                     dl_th: float, box: Optional[np.ndarray] = None) -> List[np.ndarray]:
     """Positions of the 3 triangle vertices (one per arm), Okuda Eqs. 46-56.
 
     `outer_tops[k]` / `outer_bots[k]` are arm k's two outer-vertex positions (the
     1<->4 / 2<->5 / 3<->6 coupling). Pure numpy; takes positions, returns positions.
+
+    If `box` (per-axis lengths) is given, all positions are differenced under the periodic
+    minimum-image convention -- so a short edge straddling a box face is NOT split through
+    the box centre -- and the returned triangle vertices are wrapped into [0, L). `box=None`
+    (default) is the non-periodic behaviour, bit-identical to before.
     """
-    r0 = 0.5 * (p10 + p11)                                  # Eq. 50: edge midpoint
-    uT = _unit(p10 - p11)                                   # Eq. 49: edge axis
+    if box is None:
+        r0 = 0.5 * (p10 + p11)                              # Eq. 50: edge midpoint
+        uT = _unit(p10 - p11)                               # Eq. 49: edge axis
+        diff = lambda a: a - r0
+        wrap = lambda q: q
+    else:
+        box = np.asarray(box, float)
+        d = _minimg(p11 - p10, box)
+        r0 = p10 + 0.5 * d                                  # Eq. 50: edge midpoint (min-image)
+        uT = _unit(-d)                                      # Eq. 49: edge axis (min-image)
+        diff = lambda a: _minimg(a - r0, box)
+        wrap = lambda q: _wrapbox(q, box)
     vproj = []
     for ot, ob in zip(outer_tops, outer_bots):
-        d_top = _unit(ot - r0)
-        d_bot = _unit(ob - r0)
+        d_top = _unit(diff(ot))
+        d_bot = _unit(diff(ob))
         w = 0.5 * (d_top + d_bot)                           # Eqs. 54-56
         vproj.append(w - np.dot(w, uT) * uT)                # Eqs. 51-53: project off edge
     # L_max = largest edge of the triangle formed by the projected v-vectors.
@@ -125,26 +160,42 @@ def place_i_to_h_xyz(p10: np.ndarray, p11: np.ndarray,
                 for i in range(3) for j in range(i + 1, 3))
     if l_max == 0:
         l_max = 1.0
-    return [r0 + (dl_th / l_max) * vp for vp in vproj]       # Eqs. 46-48
+    return [wrap(r0 + (dl_th / l_max) * vp) for vp in vproj]  # Eqs. 46-48
 
 
 def place_h_to_i_xyz(tri_pts: List[np.ndarray], outer_tops: List[np.ndarray],
-                     dl_th: float) -> Tuple[np.ndarray, np.ndarray]:
+                     dl_th: float, box: Optional[np.ndarray] = None
+                     ) -> Tuple[np.ndarray, np.ndarray]:
     """Positions of the 2 recovered edge vertices (v10, v11), Okuda Eqs. 42-45.
 
     `tri_pts` are the 3 triangle-vertex positions; `outer_tops` the 3 cap_top-side outer
     positions (used only to orient the normal). Pure numpy; takes positions, returns the
     (v10, v11) pair with v10 toward the cap_top side.
+
+    If `box` is given, the centroid/normal/orientation use the periodic minimum-image
+    convention (so a small triangle straddling a box face is not centred at the box centre)
+    and the returned edge vertices are wrapped into [0, L). `box=None` (default) is the
+    non-periodic behaviour, bit-identical to before.
     """
     p = tri_pts
-    r0 = (p[0] + p[1] + p[2]) / 3.0                          # Eq. 45: triangle centroid
-    n = _unit(np.cross(p[1] - p[0], p[2] - p[0]))            # Eq. 44: triangle unit normal
+    if box is None:
+        r0 = (p[0] + p[1] + p[2]) / 3.0                      # Eq. 45: triangle centroid
+        n = _unit(np.cross(p[1] - p[0], p[2] - p[0]))        # Eq. 44: triangle unit normal
+        top_off = np.mean([ot - r0 for ot in outer_tops], axis=0)
+        wrap = lambda q: q
+    else:
+        box = np.asarray(box, float)
+        d1 = _minimg(p[1] - p[0], box)
+        d2 = _minimg(p[2] - p[0], box)
+        r0 = p[0] + (d1 + d2) / 3.0                          # Eq. 45: centroid (min-image)
+        n = _unit(np.cross(d1, d2))                          # Eq. 44: unit normal (min-image)
+        top_off = np.mean([_minimg(ot - r0, box) for ot in outer_tops], axis=0)
+        wrap = lambda q: _wrapbox(q, box)
     # orient n toward the cap_top-side outer vertices.
-    top_mean = np.mean(outer_tops, axis=0)
-    if np.dot(top_mean - r0, n) < 0:
+    if np.dot(top_off, n) < 0:
         n = -n
     half = 0.5 * dl_th
-    return r0 + half * n, r0 - half * n                      # Eqs. 42-43
+    return wrap(r0 + half * n), wrap(r0 - half * n)          # Eqs. 42-43
 
 
 def place_i_to_h(cfg: "topo.IConfig", dl_th: float) -> List[np.ndarray]:

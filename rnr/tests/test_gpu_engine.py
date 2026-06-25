@@ -32,28 +32,37 @@ def _cuda_or_skip():
     return cuda[0]
 
 
-def _setup_unit_foam(dev, n=3, headroom=3000, ic="demixed"):
-    """Build the TF two-type periodic foam, extract it, and SCALE to unit cells so the
-    production force params (V0~1, A0~5.6) apply directly. Returns g, phys, body_type, box,
-    v0, a0 (the measured post-scale means)."""
+def _build_unit_foam_host(n=3, headroom=3000, ic="demixed"):
+    """TF-dependent host build: TF two-type periodic foam -> compact CSR, SCALED to unit cells
+    (so production params V0~1, A0~5.6 apply), + per-body phys state + box + (v0, a0). Returns the
+    host-artifact dict {csr, state, box, v0, a0} that foam_cache caches and `upload_unit_foam`
+    turns into a device mesh. Split out of _setup_unit_foam so the (slow) build can be disk-cached.
+    The CSR (not a padded mesh) is scaled + cached so the cache is headroom-independent."""
     mesh = tfv.MeshSolver.get().get_mesh()
     with _periodic(mesh, True):
         bodies, box, btA, btB, b_is_B, adh = _build_two_type_foam(n=n, ic=ic)
         csr = extract_csr(bodies)
         state = P.phys_state_from_tf(bodies, lambda b: 1 if b.id in b_is_B else 0)
-    pm = PaddedMesh.from_csr(csr, v_headroom=headroom, s_headroom=headroom,
-                             ring_pad=64, vs_pad=64, bs_pad=64)
     # scale positions + box so the mean cell volume is 1 (production regime)
     mean_vol = float(np.mean([b.volume for b in bodies]))
     s = mean_vol ** (1.0 / 3.0)
-    pm.vert_pos[:pm.n_v_used] /= s
+    csr.vert_pos = csr.vert_pos / s
     box = np.asarray(box, float) / s
+    pm = PaddedMesh.from_csr(csr, v_headroom=headroom, s_headroom=headroom,
+                             ring_pad=64, vs_pad=64, bs_pad=64)
     geom = P.compute_geometry(pm, box)
     v0 = float(geom.bvol[:pm.nb].mean())
     a0 = float(geom.barea[:pm.nb].mean())
-    g = W.attach_box(pm.to_warp(device=dev), box)
-    phys = W.upload_phys(state, dev)
-    return g, phys, state.body_type, box, v0, a0
+    return dict(csr=csr, state=state, box=box, v0=v0, a0=a0)
+
+
+def _setup_unit_foam(dev, n=3, headroom=3000, ic="demixed"):
+    """Build the TF two-type periodic foam, extract it, and SCALE to unit cells so the
+    production force params (V0~1, A0~5.6) apply directly. Returns g, phys, body_type, box,
+    v0, a0 (the measured post-scale means). Cache-free direct path (the tests use this); the disk
+    cache (foam_cache.load_or_build, used by gpu_stability) wraps the SAME two halves."""
+    from ..gpu.foam_cache import upload_unit_foam
+    return upload_unit_foam(_build_unit_foam_host(n=n, headroom=headroom, ic=ic), dev, headroom)
 
 
 def test_forward_step_is_stable_and_bounded(vsolver):

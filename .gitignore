@@ -38,6 +38,11 @@ rnr/exports/overnight_run*.log
 rnr/exports/sweep_logs/
 rnr/exports/sweep_run*.log
 rnr/exports/sort_active_frames/
+rnr/exports/fig_run_logs/
+rnr/exports/gpu_cells_frames/
+
+# Cached unit-cell foams (build-once geometry, regenerable de novo; can be large npz blobs)
+rnr/exports/foam_cache/
 rnr/exports/vertex_motion_frames/
 rnr/exports/native_gl_frames/
 rnr/exports/native_cells_frames/

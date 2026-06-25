@@ -622,6 +622,48 @@ own CUDA runtime; mixing with TF's conda CUDA risks conflicts) — use a separat
       device prefix-sum (O(cands) readback → none); a larger/longer sort for a publication-grade Fig
       1E/1F vs the TF oracle; then the hand-CUDA-in-fork port (the two-vehicle plan's second leg).
 
+#### Decision (2026-06-25): orientation/closure repair — KEEP greedy, defer the tvm port
+
+The RNR-at-scale balloon (commit `8e5b79e`) is healed by `orient_warp.orient_repair_warp`, a
+fully-on-device **greedy closure-residual flip**. The prior handoff promoted porting `tvm`'s exact
+`updatePolygonDirections` (per-cell BFS orientation propagation) as the recommended robustness
+upgrade. **Decided to keep greedy** and treat the tvm port as *optional/later*:
+- At the paper-scale gate `interval=round(0.01/dt)=1` ⇒ orient runs every step (100k/run). Greedy is
+  on-device with ~no hit (n=10 = 5.6 ms/step); a host tvm port (full `from_warp` + Python BFS per
+  step) is ~**3–6× slower** — it worsens the very host-copy bottleneck listed as the top perf item.
+- Greedy's "in-principle stall" is **rare by construction** (I→H sets only 1 new winding; reserved
+  batch winners are body-disjoint; degenerate initial faces are isolated single-bad-face cells) and
+  is **already caught by the gate** as a volume-band balloon FAIL — not silent at the gate level.
+- The tvm method's real edge (topological ⇒ correct for zero-area faces immediately; best C++-port
+  reference) matters for the *eventual native C++ MeshQuality port*, not the GPU hot loop.
+
+Optional follow-ups if revisited: (a) cheap — add a closure post-condition assert to orient; (b)
+implement tvm `updatePolygonDirections` as a **host reference + pytest oracle / rare fallback** (not
+in the hot loop). Revisit triggers + full pros/cons: `docs/2026-06-25_orientation-repair-options.md`;
+memory `orientation-repair-greedy-kept`.
+
+#### Perf (2026-06-25): foam build is cached to disk, not optimized (yet)
+
+The O(N²) TF foam builder makes N=2000 setup ~10 min (the stepping itself is fast). Rather than
+optimize `_setup_unit_foam`, the built unit-cell foam is now **cached to disk** (`rnr/gpu/foam_cache.py`):
+build-once → save the scaled compact CSR + per-body phys state + box + (v0,a0) as npz (no TF needed
+on load, headroom-independent) → repeat runs load in ~ms with a **de-novo fallback** if absent
+(`--rebuild-foam` forces a rebuild). Optimizing the builder itself stays low priority.
+
+#### Correctness (2026-06-25): periodic minimum-image in the I↔H Okuda placement — FIXED
+
+The reconnection placement (`reconnect.place_i_to_h_xyz`/`place_h_to_i_xyz` + the 4 GPU
+`reconnect_warp` kernels) computed the edge midpoint / triangle centroid / outer-neighbour
+directions with **raw** coordinates, so a short edge / small triangle STRADDLING a periodic box
+face was split through the box centre (teleporting the new vertices). Latent because the trigger
+fires on small features (usually interior) and the round-trip/fingerprint gates use non-periodic
+meshes. Fixed by differencing all positions under minimum-image (`d_minimg`) and wrapping results
+into [0,L) (`d_wrapbox`); `box=None`/zero-box is the exact non-periodic path (interior sites are
+bit-identical, so the existing 79 GPU + CPU round-trip/fingerprint gates are unaffected). New gate
+`rnr/tests/test_periodic_placement.py` (5 tests: CPU straddle correctness both directions +
+interior==non-periodic invariance + GPU==CPU periodic parity). Full gate **132 passed**;
+`gpu-stability --n 4` STABLE with min-image active. (Closes prior-handoff item #3.)
+
 **Risks to confront in this order:** (1) Warp on sm_120 actually initializes → verify *first*;
 (2) the parallel slot allocator + count-changing surgery (Gate B) — the real research risk;
 (3) fp32 vs reversibility tolerance (use fp64 placement if Gate B fails in fp32);
