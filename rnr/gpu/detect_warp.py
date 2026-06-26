@@ -89,6 +89,54 @@ def find_small_triangles_warp(g: dict, threshold: float) -> np.ndarray:
     return np.sort(out.numpy()[:k])                 # canonical (surface-ascending) order
 
 
+_TRI_BUF_START = 8192   # grown to >= n_s on first use; small triangles are rare so k is tiny
+
+
+def _ensure_tri_buf(g: dict, cap: int) -> dict:
+    """Get-or-grow the reusable [H] scan+sort buffer (stashed on g['_tri_buf']). `keys` doubles as
+    the scan emit array AND the radix scratch, so it is sized 2*cap (radix_sort_pairs needs 2*count);
+    `values` is the required int32 companion. Sized >= n_s -- the scan emits at most one entry per
+    surface, so it never overflows and needs no bounds guard (unlike the I-side, whose emit can
+    exceed n_s) -- grown x2. The H emit k is tiny (small triangles are rare), so the persistent
+    footprint is ~n_s ints, negligible vs compact's double-buffer."""
+    buf = g.get("_tri_buf")
+    if buf is not None and buf["cap"] >= cap:
+        return buf
+    dev = g["device"]
+    newcap = max(cap, _TRI_BUF_START, (buf["cap"] * 2 if buf is not None else 0))
+    buf = dict(cap=newcap, keys=wp.zeros(2 * newcap, dtype=wp.int32, device=dev),
+               values=wp.zeros(2 * newcap, dtype=wp.int32, device=dev),
+               count=wp.zeros(1, dtype=wp.int32, device=dev))
+    g["_tri_buf"] = buf
+    return buf
+
+
+def find_small_triangles_device(g: dict, threshold: float):
+    """FULLY DEVICE-RESIDENT [H] trigger detect. Returns (c_tris, M): c_tris is a DEVICE int32
+    array whose first M entries are the canonical (surface-ascending) small-triangle candidate
+    indices -- the SAME set AND order as find_small_triangles_warp's host np.sort, but the candidate
+    list never leaves the device (only the scalar count M is read back, to size the downstream
+    gather/reserve/apply launches). SIMPLER than the I-side: scan_small_triangles_kernel emits one
+    thread per surface so there are NO duplicates -> a plain device sort (radix_sort_pairs on the
+    int32 surface indices) reproduces np.sort; no dedup pass. Consumed by gather_h_configs_warp_device
+    with no h2d re-upload."""
+    dev = g["device"]
+    n_s = int(g["n_used"].numpy()[1])
+    buf = _ensure_tri_buf(g, n_s)        # >= n_s so the <=1-emit-per-surface scan never overflows
+    if n_s == 0:
+        return buf["keys"], 0
+    buf["count"].zero_()
+    wp.launch(scan_small_triangles_kernel, dim=n_s, device=dev, inputs=[
+        g["vert_pos"], g["surf_alive"], g["s2v"], g["s2v_len"], g["s2b"],
+        wp.float64(threshold), buf["keys"], buf["count"]])
+    wp.synchronize_device(dev)
+    k = int(buf["count"].numpy()[0])
+    if k == 0:
+        return buf["keys"], 0
+    radix_sort_pairs(buf["keys"], buf["values"], k)   # surface-ascending == host np.sort(out[:k])
+    return buf["keys"], k
+
+
 def small_triangle_trigger_host(pm: PaddedMesh, threshold: float) -> Set[int]:
     """Host reference for scan_small_triangles_kernel: the exact same cheap trigger (alive,
     triangular, 2-bordering-cells, max edge < threshold), as a set of surface indices. The

@@ -573,6 +573,25 @@ def gather_h_configs_warp(g: dict, cand_tris: np.ndarray, device=None, buf: dict
     return out
 
 
+def gather_h_configs_warp_device(g: dict, c_tris, m: int, device=None, buf: dict = None) -> dict:
+    """Same as gather_h_configs_warp's reuse path, but the candidate triangles are already a DEVICE
+    int32 array (c_tris from detect_warp.find_small_triangles_device, valid in [0,m)) -- so the
+    host->device upload is skipped. `buf` (from _ensure_gather_buf(..., with_tri=True), sized >= m)
+    is required and `m > 0` is guaranteed by the caller. Returns the same packed-device dict shape
+    as gather_h_configs_warp; the [:m] slices feed reserve+apply with no host round-trip."""
+    dev = g["device"] if device is None else device
+    c_tri = c_tris[:m]
+    wp.launch(gather_h_kernel, dim=m, device=dev, inputs=[
+        g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"], g["s2v"], g["s2v_len"],
+        g["s2b"], g["b2s"], g["b2s_len"], c_tri,
+        buf["valid"], buf["cap_top"], buf["cap_bot"], buf["tri"], buf["side"],
+        buf["arm_side"], buf["arm_otop"], buf["arm_obot"], buf["top"], buf["bot"]])
+    return dict(tri_cand=c_tri, valid=buf["valid"][:m], cap_top=buf["cap_top"][:m],
+                cap_bot=buf["cap_bot"][:m], tri=buf["tri"][:m], side=buf["side"][:m],
+                arm_side=buf["arm_side"][:m], arm_otop=buf["arm_otop"][:m],
+                arm_obot=buf["arm_obot"][:m], top=buf["top"][:m], bot=buf["bot"][:m])
+
+
 def gather_h_configs_to_list(g: dict, cand_tris: np.ndarray, device=None):
     """Run the device [H]-gather and reconstruct the valid (triangle, HCfgIdx) list on the host
     (O(candidates) data only -- no from_warp). top[k]/bot[k] correspond to side cell side[k];

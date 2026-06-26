@@ -88,6 +88,27 @@ def test_h_hybrid_detect_matches_host(vsolver):
     assert pm.check_consistency() == [], "hybrid-detected [H] config produced an inconsistent mesh"
 
 
+def test_h_device_detect_matches_host_sort(vsolver):
+    """find_small_triangles_device (on-device sort) returns the SAME (M,) candidate array as
+    find_small_triangles_warp (host np.sort) -- byte-for-byte, both the set AND the surface-
+    ascending order (which the lowest-id-wins reservation depends on). The H-side device-resident
+    sweep (reconnect_sweep_h_to_i_warp_device) rests on this: the candidate list stays on the
+    device, only the count M is read back."""
+    dev = _cuda_or_skip()
+    _tf, _tfv, stype, btype = vsolver
+    bodies = H.build_kelvin_block(stype, btype, n=4, span=8.0, origin=(40., 8., 56.))
+    pm, nbatch = _seed_triangles(cm.extract_csr(bodies))
+    assert nbatch >= 2
+
+    g = pm.to_warp(device=dev)
+    host = dw.find_small_triangles_warp(g, threshold=1.0)              # (M,) host np.sort
+    c_tris, m = dw.find_small_triangles_device(g, threshold=1.0)       # on-device sort + count
+    device = c_tris[:m].numpy().astype(np.int32) if m else np.zeros(0, np.int32)
+    assert host.shape[0] > 0, "test mesh has no small triangles -- equivalence check would be vacuous"
+    assert m == host.shape[0], f"device M={m} != host M={host.shape[0]}"
+    assert np.array_equal(device, host), "device detect != host np.sort (set or order differs)"
+
+
 # ======================================================================================
 # I-side: short-edge trigger scan
 # ======================================================================================

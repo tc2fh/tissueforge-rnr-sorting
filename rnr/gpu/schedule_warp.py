@@ -32,9 +32,10 @@ import warp as wp
 
 from .detect_warp import (detect_short_edges_hybrid, detect_small_triangles_hybrid,
                           find_short_edges_device, find_short_edges_warp,
-                          find_small_triangles_warp)
+                          find_small_triangles_device, find_small_triangles_warp)
 from .device_mesh import PaddedMesh
-from .gather_warp import (_ensure_gather_buf, gather_h_configs_warp, gather_i_configs_warp,
+from .gather_warp import (_ensure_gather_buf, gather_h_configs_warp,
+                          gather_h_configs_warp_device, gather_i_configs_warp,
                           gather_i_configs_warp_device)
 from .reconnect_csr import HCfgIdx, ICfgIdx
 from .reconnect_warp import (apply_h_to_i_batch_warp, apply_h_to_i_device_warp,
@@ -581,13 +582,15 @@ def reconnect_sweep_h_to_i_warp(g: dict, threshold: float, dl_th: Optional[float
 def reconnect_sweep_h_to_i_warp_device(g: dict, threshold: float, dl_th: Optional[float] = None,
                                        max_rounds: int = 64) -> Dict[str, object]:
     """FULLY-ON-DEVICE reverse H->I sweep (Option A: device-resident; the mirror of
-    reconnect_sweep_warp_device). Each round: find_small_triangles_warp emits the small candidate
-    list in canonical (triangle-ascending) order; gather_h_configs_warp emits packed DEVICE arrays
-    (Condition-4 veto fused); reserve_h_won_device runs the C2' lowest-id-wins reservation on those
-    arrays (the only host readback is the winner count); apply_h_to_i_device_warp runs every
-    winner's H->I in parallel from the device arrays. No PaddedMesh.from_warp(g), no per-candidate
-    host round-trip. Math unchanged vs the host-packed path -> round 1 stays fingerprint-equal to
-    reconnect_sweep_h_to_i_warp. Same cascade/headroom caveats."""
+    reconnect_sweep_warp_device). Each round: find_small_triangles_device emits the small candidate
+    list in canonical (triangle-ascending) order, KEPT ON DEVICE (the scan emits one per surface so
+    a plain device radix sort reproduces np.sort -- no dedup; only the scalar count M is read back);
+    gather_h_configs_warp_device emits packed DEVICE arrays from it (Condition-4 veto fused, no h2d
+    re-upload); reserve_h_won_device runs the C2' lowest-id-wins reservation on those arrays (its
+    readback is the winner count); apply_h_to_i_device_warp runs every winner's H->I in parallel
+    from the device arrays. No PaddedMesh.from_warp(g), no per-candidate host round-trip, and now
+    no candidate d2h/h2d. Math unchanged vs the host-packed path -> round 1 stays fingerprint-equal
+    to reconnect_sweep_h_to_i_warp. Same cascade/headroom caveats."""
     if dl_th is None:
         dl_th = threshold
     dev = g["device"]
@@ -595,11 +598,11 @@ def reconnect_sweep_h_to_i_warp_device(g: dict, threshold: float, dl_th: Optiona
     round_sizes: List[int] = []
     rounds = 0
     while rounds < max_rounds:
-        tris = find_small_triangles_warp(g, threshold)    # triangle-ascending; only host data
-        if len(tris) == 0:                                # empty-step fast path
+        c_tris, m = find_small_triangles_device(g, threshold)   # DEVICE surface-ascending + count M
+        if m == 0:                                        # empty-step fast path (no host candidate copy)
             break
-        buf = _ensure_gather_buf(g, "_h_gather_buf", len(tris), with_tri=True)  # reused scratch
-        gathered = gather_h_configs_warp(g, tris, device=dev, buf=buf)    # packed DEVICE arrays + fused veto
+        buf = _ensure_gather_buf(g, "_h_gather_buf", m, with_tri=True)  # reused scratch
+        gathered = gather_h_configs_warp_device(g, c_tris, m, device=dev, buf=buf)  # device-in: no h2d
         won = reserve_h_won_device(g, gathered)           # device won mask (skips invalid rows)
         wp.synchronize_device(dev)
         n_win = int(won.numpy().sum())                    # the loop's only readback: winner count
