@@ -115,16 +115,18 @@ _SWAPPED = ("vert_pos", "vert_alive", "v2s", "v2s_len", "surf_alive", "s2v", "s2
 
 
 def compact_warp(g: dict) -> dict:
-    """Compact dead vertex/surface slots in the device SoA `g` IN PLACE (the arrays in `g` are
-    replaced with fresh, compacted ones; cap_v/cap_s/MAX_*/nb are unchanged). Returns `g`.
-    Matches PaddedMesh.compact() by fingerprint and slot-for-slot.
+    """Compact dead vertex/surface slots in the device SoA `g` IN PLACE (the arrays in `g` keep
+    their addresses; their contents become the compacted set; cap_v/cap_s/MAX_*/nb unchanged).
+    Returns `g`. Matches PaddedMesh.compact() by fingerprint and slot-for-slot.
 
     Double-buffered: the scratch arrays + the prefix-scan buffers are allocated ONCE (lazily) and
-    reused, reset on-device (`fill_(-1)`/`zero_()`) instead of rebuilt on the host every call.
-    Bit-identical to the alloc-every-call version (same scan + scatter; dead slots reset to the
-    same -1/0 pad). No `wp.synchronize` -- same-stream ordering makes the pointer swap safe, and
-    the only caller that reads `n_used` (engine.forward_step) syncs there; dropping the barrier
-    also lets concurrent sims overlap."""
+    reused, reset on-device (`fill_(-1)`/`zero_()`) instead of rebuilt on the host every call. Scan
+    + scatter write the compacted result into the scratch, which is then COPIED BACK into g's
+    canonical arrays (fixed addresses -- a CUDA-graph-capture prerequisite; see the tail). Bit-
+    identical to the alloc-every-call version (same scan + scatter; dead slots reset to the same
+    -1/0 pad). No `wp.synchronize` -- same-stream ordering makes the copy-back safe, and the only
+    caller that reads `n_used` (engine.forward_step) syncs there; dropping the barrier also lets
+    concurrent sims overlap."""
     dev = g["device"]
     cap_v, cap_s, nb = g["cap_v"], g["cap_s"], g["nb"]
     if "_compact_alt" not in g:
@@ -155,10 +157,14 @@ def compact_warp(g: dict) -> dict:
     wp.launch(_set_nused_kernel, dim=1, device=dev, inputs=[
         scan_v, g["vert_alive"], scan_s, g["surf_alive"], cap_v, cap_s, dst["n_used"]])
 
-    # ping-pong: the compacted scratch becomes g's live set; g's old set becomes the next scratch
-    # (same shapes). Pure pointer swap -- ordered on the stream after the scatters above.
-    old = {k: g[k] for k in _SWAPPED}
+    # Copy the compacted scratch back into g's CANONICAL arrays (FIXED addresses across compacts).
+    # This replaces the old pointer ping-pong (g[k]=dst[k]): a CUDA graph captures device addresses,
+    # so the mesh arrays must keep stable addresses for a captured forward_step to replay correctly
+    # (docs/2026-06-26_cuda-graph-experiment-scope.md, P2). dst stays the reused scratch (reset to
+    # pad at the top of the next call). Stream-ordered after the scatters above (which read g, write
+    # dst), so the copy back into g is safe; contents are identical to the swap -> bit-identical.
+    # Cost: one device->device copy of the SoA per compact (~tens of us at n=16); the price of
+    # capture-compatibility (the swap was free).
     for k in _SWAPPED:
-        g[k] = dst[k]
-    g["_compact_alt"] = old
+        wp.copy(g[k], dst[k])
     return g
