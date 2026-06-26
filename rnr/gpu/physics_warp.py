@@ -337,6 +337,24 @@ def compute_geometry_warp(g: dict) -> dict:
                 bvol=bvol, barea=barea, bcent=bcent, borient=borient)
 
 
+def compute_surface_geom_warp(g: dict) -> dict:
+    """Surface-only geometry (centroid/area/UNNORMALIZED normal); runs ONLY surface_geom_kernel,
+    skipping the body kernel + its 4 allocs. For callers that need just snorm (orient_repair_warp).
+    The returned snorm is byte-identical to compute_geometry_warp's (same kernel, same inputs); the
+    body kernel never feeds back into the surface kernel, so dropping it is arithmetic-preserving.
+    (Measured ~46% of full geometry at n=16; allocs are free here -- the mempool zeros for nothing.)"""
+    dev = g["device"]
+    cap_s = g["cap_s"]
+    box = g["box"]
+    scent = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    sarea = wp.zeros(cap_s, dtype=wp.float64, device=dev)
+    snorm = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    wp.launch(surface_geom_kernel, dim=cap_s, device=dev,
+              inputs=[g["vert_pos"], g["s2v"], g["s2v_len"], g["surf_alive"], box],
+              outputs=[scent, sarea, snorm])
+    return dict(scent=scent, sarea=sarea, snorm=snorm)
+
+
 def compute_forces_warp(g: dict, geom_w: dict, params: PhysParams, phys: dict) -> wp.array:
     """Launch the force kernel; return a device (cap_v,) vec3d force array."""
     dev = g["device"]

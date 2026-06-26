@@ -21,7 +21,7 @@ This runs on the device after each reconnection sweep (engine.forward_step); it 
 parallel, and reverses only the handful of inconsistent faces (typ. 0-3 per step)."""
 import warp as wp
 
-from .physics_warp import compute_geometry_warp
+from .physics_warp import compute_surface_geom_warp
 
 wp.init()
 
@@ -94,7 +94,7 @@ def orient_repair_warp(g: dict, max_iter: int = 4) -> int:
     dev = g["device"]
     cap_s = g["cap_s"]
     nb = g["nb"]
-    gw = compute_geometry_warp(g)
+    gw = compute_surface_geom_warp(g)                # ONLY snorm is needed -> skip the body kernel
     snw = wp.clone(gw["snorm"])                      # working snorm (negated in place on flips)
     clo = wp.zeros(nb, dtype=wp.vec3d, device=dev)
     flip = wp.zeros(cap_s, dtype=wp.int32, device=dev)
