@@ -1,9 +1,24 @@
 # CUDA-graph capture of `forward_step` — experiment scope
 
-**Date:** 2026-06-26 · **Status:** P0 + capture_while de-risk + **P1 + P2 DONE** (all bit-identical, 134-gate); **P3 next** · **Branch:** `migrate/linux64-wsl2`
+**Date:** 2026-06-26 · **Status: ★ P3 RESOLVED** — full forward_step graph capture WORKS; **captured-sequential replay SATURATES at production scale (util 90% @ n=16, K=8; single-sim −33%)**. GO/NO-GO ANSWER: **C++ NOT needed for performance** — port = TF-integration milestone only. The n=10 72% was a small-n occupancy artifact; multi-stream overlap (P4) + its shared-CUB-workspace blocker are MOOT for production. (P0/capture_while/P1/P2 done; batched-driver +19%/63% superseded.) · **Branch:** `migrate/linux64-wsl2`
 
 ## Progress (2026-06-26)
 
+- **Batched-driver intermediate TESTED** (`scratchpad/batched_driver.py`, the P0 "cheaper
+  intermediate"): advance all K sims through each reconnect round TOGETHER → ONE
+  `wp.synchronize_device` per phase-round instead of per-sim-round (the K× sync cut), reusing the
+  exact kernels (detect/gather/reserve/apply), syncs stripped from `apply_*` + deferred from detect.
+  **Result @ K=16, n=16, dt=0.01, σ=0.5 (reconnection-ACTIVE: ~9.8 recon/sim-step), fair fresh-mesh
+  per mode, 2 reps each, ROCK-STABLE:** sequential 62.2 ms/round, util 51%, 257 agg steps/s vs
+  **batched 52.3 ms/round, util 63%, 306 agg steps/s = +19% throughput, +12 pp util, −16% wall.**
+  Reconnection total IDENTICAL (62795) both modes/reps → pure scheduling win, NOT less work.
+  **VERDICT: real bankable win, but PLATEAUS below the 80–90%/1.7–1.9× saturation target** → per the
+  scope's own go/no-go, batching alone does NOT retire the C++ question; **P3 graphs still justified.**
+  Remaining ceiling above 63% = (a) per-round phase barriers still serialize (I-sweep 3, H-sweep 2)
+  and (b) Python per-launch overhead (~160 kernels/step from a Python loop at K=16) — only graph
+  CAPTURE kills (b). Next cheap read before full P3: fixed-`MAX_CAND` masked dedup/gather launches to
+  drop the k/M reads → 1 sync/round; if util→~75% the barriers were the issue, if still ~63% it's
+  launch overhead (→ capture essential).
 - **Phase 0 DONE** — verdict PROCEED, bottleneck localized to the reconnect path (see results below).
 - **capture_while de-risk DONE** — `scratchpad/test_capture_while.py`: `wp.capture_while` (eager + inside
   a captured graph, replayed 2× with different device conditions → looped 3 then 7 times) and
@@ -102,6 +117,109 @@ violates all three:
    "candidates remain" flag; gather/reserve/apply launch over a **fixed `MAX_CAND` dim and self-mask** on the
    device-`M`; compact/orient gated by `wp.capture_if` on a device "reconnected" flag. The recon-count/`n_used`
    readback for stats + the slot-exhaustion safety check moves to **one** post-replay sync (or every ~500 steps).
+
+## ★ P3 RESOLVED (2026-06-26) — graph capture SATURATES at production scale; C++ NOT needed for perf
+
+**The decisive result: captured-sequential replay reaches util 90% at n=16 (production cell scale), K=8 —
+saturation, with NO multi-stream overlap.**
+
+| n | mode | K | util | steps/s | single-sim capture |
+|---|---|---|---|---|---|
+| 10 | captured_seq | 16 | 72% | 281 | −30% |
+| **16** | seq_eager | 8 | 67% | 161 | — |
+| **16** | **captured_seq** | **8** | **90%** | **232 (+44% vs eager)** | **−33%** |
+
+The earlier 72% was a **small-n artifact**: at n=10 (2000 cells/sim) the per-kernel occupancy is low, so a
+single sim underfills the GPU and overlap would matter. At n=16 (8192 cells/sim) each kernel fills the GPU,
+so **sequential captured-graph replay alone saturates (90%)** — even at LOWER K (8 vs 16). Per-sim occupancy
+(n), not cross-sim overlap, is the dominant factor at production scale.
+
+**→ GO/NO-GO ANSWER: Warp graph capture delivers GPU saturation (~90%) at production scale. C++ is NOT needed
+for performance.** The port reduces to the TF-integration milestone (native `MeshQuality` op), to be done when
+the algorithm is frozen — exactly the outcome the scope's go/no-go predicted for an 80–90% result. The
+multi-stream-overlap path (P4) and its blocker below are MOOT for production (only relevant at tiny n).
+
+**P4 multi-stream blocker (documented, now moot):** concurrent replay of K full-step graphs on K `wp.Stream`s
+faults (CUDA 700) — isolated via fresh-process tests (an illegal access POISONS the context, so each mode
+needs its own process): single pieces (prefix, compact, ONE I-round) replay concurrently fine, but **8
+I-rounds fail** → the `radix_sort_pairs`/`array_scan` **shared per-device CUB workspace** is a probabilistic
+race that accumulates over many library-op calls (1 call lucky, 16 calls reliably corrupts). Fixing it (only
+needed if small-n ensembles ever matter) = custom per-`g`-scratch scan/sort kernels, or a dedup/sort-free
+perf variant. This is the concrete "Warp 1.14 multi-stream + captured library ops is constrained" signal — but
+it does NOT gate the perf goal, which captured-sequential already meets.
+
+### Earlier readings (superseded by the n=16 result above)
+## P3 CAPTURE RESULTS (2026-06-26) — graph capture WORKS; captured-sequential hits util 72% @ K=16
+
+Full fixed-dim `forward_step` (prefix + fixed-R=8 I-rounds + fixed-R=8 H-rounds + compact) assembled
+(`scratchpad/proto_capture_step.py`) and captured with plain `wp.ScopedCapture`. All de-risks GREEN:
+fixed-dim masked detect + winners byte-identical (I+H, `proto_fixeddim_detect.py`/`proto_capture_round.py`);
+`radix_sort_pairs`+`array_scan`+compact all capturable (`proto_capture_smoke.py`); full step captures+replays.
+
+**Numbers (n=10, dt=0.01, σ=0.5, RTX 5090):**
+- **Single-sim: captured −30%** (5.4 → 3.75 ms/step) — the full step (not just the prefix, which P0 said
+  graphs barely help) wins big because the reconnect path's MANY small kernels carried heavy per-launch
+  host overhead that capture erases.
+- **K=16, captured-SEQUENTIAL replay (no overlap): util 50%→72%, throughput 178→281 steps/s (+58%)** vs the
+  same fixed-R work launched eagerly. **This already EXCEEDS the batched driver's 63%** and approaches the
+  80–90% saturation bar — WITHOUT multi-stream overlap. (seq_eager here does fixed-R=8 always, so its
+  baseline is below production's variable-round path; the +58% is the pure host-overhead elimination.)
+
+**P4 multi-stream overlap is BLOCKED by a Warp internals limit (the concrete "Warp too constrained" signal
+the scope predicted).** Replaying the K captured graphs concurrently on K `wp.Stream`s → CUDA error 700
+"illegal memory access". Root cause: `array_scan`/`radix_sort_pairs` call Warp's C++ runtime
+(`wp_array_scan_int_device`/`wp_radix_sort_pairs_*_device`), which uses a **shared per-device CUB
+workspace**; captured into K graphs they bake the SAME workspace address, so concurrent replay races on it.
+Sequential replay reuses it safely (→ captured_seq is correct). Also: capturing on a CUSTOM stream fails
+outright ("invalid device ordinal" in scan_device) — so graphs must be captured on the DEFAULT stream and
+replayed elsewhere. **To unblock P4 → 80–90%:** replace array_scan/radix_sort in the captured region with
+custom Warp kernels using PER-`g` scratch (no shared workspace) — significant but stays in Warp; OR accept
+captured_seq's 72%. This is the specific evidence for whether the FINAL overlap increment needs raw CUDA.
+
+**GO/NO-GO READ:** Warp graph capture delivers util ~72% @ K=16 (sequential replay) — **C++ is NOT needed to
+get most of the way to saturation.** The last ~10–20pp (multi-stream overlap) hits a Warp shared-CUB-workspace
+limit; closing it needs per-`g` scan/sort scratch (Warp-side, doable) — not a wholesale C++ rewrite.
+
+## P3 SIMPLIFICATION (2026-06-26) — fixed-R unrolled + plain capture; `capture_while` is OPTIONAL
+
+The scope below assumed `capture_while` (data-dependent device round loop) is REQUIRED. It is not, for
+the first saturation measurement. A simpler, byte-identical path:
+
+- **Run a FIXED `max_rounds` (e.g. 8) unrolled, NO host break.** With fixed-dim launches + a device-scalar
+  `M` masking the tail, an EMPTY round (M==0) is an all-threads-early-return no-op. The host `while` already
+  bounds rounds at `max_rounds` and breaks early; running exactly `max_rounds` with masked no-op tail rounds
+  reaches the SAME converged state (extra rounds mutate nothing) → byte-identical. So the round loop needs no
+  device control flow — it's a fixed unrolled sequence, capturable with a **plain `wp.ScopedCapture`** (the
+  P0-proven mechanism). `capture_while` becomes a LATER optimization (skip the masked no-op rounds' launch
+  cost), not a prerequisite — de-risks the load-bearing phase.
+- The real work either way is the **fixed-dim masked reconnect** (device-scalar `M` guard); that's unchanged.
+
+**FOUNDATION VERIFIED (2026-06-26, `scratchpad/proto_fixeddim_detect.py`): the fixed-dim masked
+device-scalar-M I-detect is BYTE-IDENTICAL to production `find_short_edges_device`** across 200 reconnecting
+steps (199 with candidates, maxM=27, 0 mismatches). Key finding: the detect kernels ALREADY carry the
+sentinel mechanism (`_SENTINEL_KEY` for `keep==0` rows → sort to tail → never emitted), so launching
+scan/build_keys/`radix_sort_pairs(…, CAP)`/mark/`array_scan(…[:CAP])`/scatter over the FIXED buffer cap
+self-masks — the ONLY new kernel needed is a **guarded `filter`** (`tid >= count[0] → keep=0`, else the exact
+interior test), because filter alone would run `d_vert_body_count` on the stale tail. `M = out_pos[CAP-1]` is
+then a device scalar (no host `k`/`M` read). The radix sort over fixed CAP (sentinel tail sorts last) leaves
+the real keys' order identical → same deduped (v10,v11)-ascending set + same M.
+
+**Remaining P3 steps (each follows the SAME fixed-dim+mask pattern, lower risk than detect):**
+1. **gather** fixed-dim: launch `gather_i_kernel` over a fixed `MAX_CAND`, add a device-`M` guard
+   (`tid >= M → valid=0`); reserve/apply already self-skip on `valid`/`won`, so only gather needs the guard.
+   Verify byte-identical (read-only, no mesh clone needed) — mirror `proto_fixeddim_detect.py`.
+2. **reserve** owners pre-allocated: `vown/sown/bown/won` are `wp.full/wp.zeros` per round (the last
+   in-region allocs) → pre-allocate on `g`, `fill_(MAX_CAND)`/`zero_` in place each round; launch over fixed
+   `MAX_CAND`. (`m = valid.shape[0]` is already host-known, becomes the fixed `MAX_CAND`.)
+3. **apply** fixed-dim: launch `apply_*_won_kernel` over `MAX_CAND` (already skips `won[i]==0`); strip the
+   trailing `wp.synchronize_device`. Verify a single fixed-dim ROUND byte-identical vs the production sweep's
+   round (needs a `g` snapshot/clone to compare the mutation).
+4. **H-side** mirror (simpler: no dedup, `M==k`; `find_small_triangles_device` + gather_h/reserve_h/apply_h).
+5. **fixed-R captured step**: pre-fill empty-round safety (masked no-ops), wrap prefix + R I-rounds + R
+   H-rounds + compact + orient(fixed-iter, no counter readback) in `wp.ScopedCapture`; replay per step.
+   Director seed is `step`-varying (engine.py:42 `step*nb`) → feed `step` via a device array the graph reads.
+6. **measure** single-sim + multi-stream K=16 (P4: each sim its own graph + `wp.Stream`). Compare util/
+   throughput to the batched driver's 63% / 306 steps/s. **THE go/no-go number** for the C++-port question.
 
 ## Bit-identicality argument (the gate is byte-identical trajectories)
 
