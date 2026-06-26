@@ -64,11 +64,31 @@ default = `use_capture_while=True, max_rounds=8` (cap) is the production config:
 saturating, no per-σ round-count measurement. (`max_rounds` fixed-R + the two guards remain as a validated
 fallback `use_capture_while=False`.)
 
-**REMAINING (next session): wire `CapturedStep` into the production ensemble drivers** (`run_overnight` /
-`gpu_fig_runs`) — per-sim `CapturedStep()` (capture_while default), replay per step, periodic `read_stats()`
-for the audit + the overflow flag. `scratchpad/proto_ensemble_captured.py` is the proven template. Validate the
-interval>1 prefix-graph path for dt<0.01 regimes. Multi-stream P4 stays MOOT (sequential replay already
-saturates at 99%).
+### ★ WIRED INTO THE DRIVERS (2026-06-26 PM) — `--captured` opt-in; + the concurrency-model nuance
+
+`CapturedStep` is now wired into the production faithfulness/figure path as an **opt-in `--captured`** flag:
+- **`gpu_stability.py --captured`** — drives the loop with `CapturedStep` (capture_while) instead of eager
+  `forward_step`; warms up → resumes at `cs.next_step`; recon I/H untracked under capture; slot+overflow guards
+  + the audit move to the checkpoint (`read_stats()` = the only sync). VALIDATED byte-identical to the eager run
+  (het to full precision, nv/ns/vol/n_problems exact @ n=10, 2k). interval>1 (dt=0.002→interval=5) prefix-graph
+  path also byte-identical (`scratchpad/proto_captured_traj.py PROTO_DT=0.002`).
+- **`gpu_fig_runs.py --captured`** — forwards `--captured` to each per-sim subprocess. End-to-end smoke green.
+
+**THE NUANCE (concurrency model matters): the captured win shows up SINGLE-SIM / IN-PROCESS, NOT in the
+process-pool the figure pipeline uses.** Single-sim @ n=10: eager 3.51 → captured 2.74 ms/step = **+22%** (n=16
+in-process K-sim was +42%, higher occupancy). But `gpu_fig_runs` runs K **separate processes** (CONC≈6), and OS
+process concurrency ALREADY saturates the GPU (the host overhead of one process overlaps another's GPU work):
+measured **eager pool 82.7s vs captured pool 81.05s** (4 jobs ×12k steps, sequential A/B) ≈ neutral. So
+`--captured` there is byte-identical + harmless but adds ~no aggregate throughput at production concurrency;
+its real value is single-sim / low-concurrency runs (where the GPU would otherwise idle between host trips), and
+it lets you hit the same throughput at LOWER CONC (less CPU/host load). **Banking the +42% would need switching
+the pipeline to the IN-PROCESS K-sim model** (one process, K `CapturedStep`s, sequential replay —
+`scratchpad/proto_ensemble_captured.py`); but the process-pool is already GPU-saturated, so that's a
+nice-to-have, not a throughput necessity. Multi-stream P4 stays MOOT.
+
+**REMAINING (optional, next session):** (a) regenerate the canonical Fig 1E/1F with `--captured` if desired
+(byte-identical, so figures are unchanged — purely a speed/validation exercise); (b) IF a single big-N
+(n≥16) in-process ensemble is ever wanted, build a driver around `proto_ensemble_captured.py` to bank +42%.
 
 ## Progress (2026-06-26)
 

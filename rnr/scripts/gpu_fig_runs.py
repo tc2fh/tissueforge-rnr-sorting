@@ -14,8 +14,9 @@ Fig 1E: sigma in {0.1, 0.2, 0.5}, IC=mixed (DP~0 -> rises, sigma-ordered).
 Fig 1F: sigma=0.5, IC=demixed (starts at DP_max -> holds); paired with the sigma=0.5 mixed runs.
 
 Usage:
-  pixi run python rnr/scripts/gpu_fig_runs.py [STEPS] [CONC] [SEEDS] [DT]
+  pixi run python rnr/scripts/gpu_fig_runs.py [STEPS] [CONC] [SEEDS] [DT] [--captured] [--force]
   defaults: STEPS=400000 CONC=6 SEEDS=7,8,9 DT=0.01   (~3h for 12 runs)
+  --captured: drive each sim with the CUDA-graph-captured step (byte-identical, less host overhead).
 Resumable: a run whose CSV already reaches STEPS is skipped (use --force to rerun all).
 CSVs: rnr/exports/gpu_sort_n10_S{sigma}_{ic}_dt{dt}_seed{seed}.csv
 """
@@ -33,6 +34,10 @@ GPU_STAB = os.path.join(HERE, "gpu_stability.py")
 N = 10
 SIGMAS = [0.1, 0.2, 0.5]
 FORCE = "--force" in sys.argv
+# Drive each per-sim subprocess with the CUDA-graph-captured step (gpu_stability --captured):
+# byte-identical, removes the per-step host overhead -> each concurrent sim runs faster + contends
+# the host less (capture_warp.CapturedStep / docs/2026-06-26_cuda-graph-experiment-scope.md).
+CAPTURED = "--captured" in sys.argv
 argv = [a for a in sys.argv[1:] if not a.startswith("--")]
 STEPS = int(argv[0]) if len(argv) > 0 else 400_000
 CONC = int(argv[1]) if len(argv) > 1 else 6
@@ -71,9 +76,12 @@ def build_jobs():
 
 def cmd_for(sigma, ic, seed):
     out = csv_path(sigma, ic, seed)
-    return [sys.executable, GPU_STAB, "--n", str(N), "--steps", str(STEPS), "--dt", DT,
-            "--ic", ic, "--sigma", str(sigma), "--seed", str(seed),
-            "--check-every", str(CHECK_EVERY), "--csv", out], out
+    cmd = [sys.executable, GPU_STAB, "--n", str(N), "--steps", str(STEPS), "--dt", DT,
+           "--ic", ic, "--sigma", str(sigma), "--seed", str(seed),
+           "--check-every", str(CHECK_EVERY), "--csv", out]
+    if CAPTURED:
+        cmd.append("--captured")
+    return cmd, out
 
 
 def main():

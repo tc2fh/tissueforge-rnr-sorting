@@ -43,6 +43,7 @@ from tissue_forge.models.vertex import solver as tfv
 
 from rnr.gpu import engine as E
 from rnr.gpu import physics_csr as P
+from rnr.gpu.capture_warp import CapturedStep
 from rnr.gpu.device_mesh import PaddedMesh
 
 
@@ -95,6 +96,10 @@ def main():
                     help="run RNR reconnection each interval (default on)")
     ap.add_argument("--no-reconnect", dest="reconnect", action="store_false",
                     help="force+integrate only -- isolates the integrator from the RNR pipeline")
+    ap.add_argument("--captured", action="store_true",
+                    help="drive the loop with the CUDA-graph-captured step (capture_warp.CapturedStep, "
+                         "capture_while) instead of the eager engine.forward_step -- byte-identical, "
+                         "~+42%% ensemble throughput. recon I/H are not per-step-tracked under capture.")
     args = ap.parse_args()
 
     interval = args.interval if args.interval > 0 else max(1, round(0.01 / args.dt))
@@ -153,40 +158,67 @@ def main():
     recon_hist = []          # cumulative (I+H) at each checkpoint -- to spot a topological freeze
     t0 = time.perf_counter()
 
-    for step in range(args.steps):
-        rep = E.forward_step(g, phys, params, args.dt, args.dr, seed=args.seed, step=step,
-                             threshold=args.lth, dl_th=args.lth, reconnect=args.reconnect,
-                             interval=interval, compact=True, max_rounds=8)
-        recon_i += rep["i"]
-        recon_h += rep["h"]
-        nv_max = max(nv_max, rep["nv"])
+    # Optional CUDA-graph-captured driver (capture_warp.CapturedStep, capture_while): byte-identical
+    # to the eager forward_step but ~+42% ensemble throughput. It WARMS UP a few steps during
+    # construction (advances the mesh), so the loop resumes at cs.next_step. Under capture there is NO
+    # per-step host readback, so recon I/H are not tracked and the slot/overflow guards move to the
+    # checkpoint (read_stats = one sync). Use a smaller --check-every for tighter slot guarding.
+    cs = None
+    step_start = 0
+    if args.captured:
+        cs = CapturedStep(g, phys, params, args.dt, args.dr, seed=args.seed, threshold=args.lth,
+                          dl_th=args.lth, reconnect=args.reconnect, interval=interval)
+        step_start = cs.next_step
+        print(f"[gpu-stability] CAPTURED driver: capture_while={cs.use_capture_while} "
+              f"warmup={cs.warmup_steps} (recon I/H not per-step-tracked under capture)")
 
-        # cheap per-step guards (no host copy): slot capacity is the only thing a single step
-        # can blow without an audit -- catch it immediately rather than at the next checkpoint.
-        if rep["nv"] >= cap_v or rep["ns"] >= cap_s:
-            failed_at = step
-            print(f"\n[FAIL] step {step}: slot capacity exhausted nv={rep['nv']}/{cap_v} "
-                  f"ns={rep['ns']}/{cap_s} -- compaction is not bounding slots.")
-            if args.stop_on_fail:
-                break
+    for step in range(step_start, args.steps):
+        if cs is not None:
+            cs.step(step)
+        else:
+            rep = E.forward_step(g, phys, params, args.dt, args.dr, seed=args.seed, step=step,
+                                 threshold=args.lth, dl_th=args.lth, reconnect=args.reconnect,
+                                 interval=interval, compact=True, max_rounds=8)
+            recon_i += rep["i"]
+            recon_h += rep["h"]
+            nv_max = max(nv_max, rep["nv"])
+            # cheap per-step guard (no host copy): slot capacity is the only thing a single step can
+            # blow without an audit -- catch it immediately rather than at the next checkpoint.
+            if rep["nv"] >= cap_v or rep["ns"] >= cap_s:
+                failed_at = step
+                print(f"\n[FAIL] step {step}: slot capacity exhausted nv={rep['nv']}/{cap_v} "
+                      f"ns={rep['ns']}/{cap_s} -- compaction is not bounding slots.")
+                if args.stop_on_fail:
+                    break
 
         if (step + 1) % args.check_every == 0 or step == args.steps - 1:
             sec = time.perf_counter() - t0
             a = _audit(g, box, body_type)
             recon_hist.append(recon_i + recon_h)
+            cap_bad = ""
+            if cs is not None:                       # captured: slot high-water + correctness flags (1 sync)
+                st = cs.read_stats()
+                nv_max = max(nv_max, st["nv"])
+                if st["nv"] >= cap_v or st["ns"] >= cap_s:
+                    cap_bad = f"slot capacity exhausted nv={st['nv']}/{cap_v} ns={st['ns']}/{cap_s}"
+                elif st["overflow"]:
+                    cap_bad = "MAX_CAND overflow -- captured run NOT bit-identical (raise DEFAULT_MAX_CAND)"
             degen = a["vol_max"] > vol_hi or a["vol_min"] < vol_lo
-            bad = bool(a["problems"]) or not a["finite"] or a["vol_min"] <= 0.0 or degen
+            bad = bool(a["problems"]) or not a["finite"] or a["vol_min"] <= 0.0 or degen or bool(cap_bad)
             tag = "FAIL" if bad else "ok"
+            recon_str = f"{recon_i}/{recon_h}" if cs is None else "n/a"
             print(f"[{tag}] step {step+1:>7} ({sec:6.1f}s, {1e3*sec/(step+1):.2f} ms/step) "
                   f"het={a['het']:.4f} vol[{a['vol_min']:.3f},{a['vol_max']:.3f}] "
                   f"nv={a['nv']} ns={a['ns']} nv_max={nv_max} "
-                  f"recon I/H={recon_i}/{recon_h} problems={len(a['problems'])}")
+                  f"recon I/H={recon_str} problems={len(a['problems'])}")
             rows.append(dict(step=step + 1, het=a["het"], nv=a["nv"], ns=a["ns"],
                              vol_min=a["vol_min"], vol_max=a["vol_max"],
                              recon_i=recon_i, recon_h=recon_h, nv_max=nv_max,
                              n_problems=len(a["problems"]), sec=sec))
             if bad:
                 failed_at = step
+                if cap_bad:
+                    print(f"        {cap_bad}")
                 if a["problems"]:
                     print("        first problems:", a["problems"][:5])
                 if not a["finite"]:
@@ -207,8 +239,10 @@ def main():
 
     final_ok = (failed_at is None and not final["problems"] and final["finite"]
                 and vol_lo <= final["vol_min"] and final["vol_max"] <= vol_hi)
-    # a healthy sort keeps reconnecting; a flat cumulative over the back half = topological freeze
-    frozen = len(recon_hist) >= 3 and recon_hist[-1] == recon_hist[len(recon_hist) // 2]
+    # a healthy sort keeps reconnecting; a flat cumulative over the back half = topological freeze.
+    # (Skip under --captured: recon I/H aren't tracked there, so recon_hist is all-zero -> false freeze.)
+    frozen = (cs is None and len(recon_hist) >= 3
+              and recon_hist[-1] == recon_hist[len(recon_hist) // 2])
 
     print("\n" + "=" * 78)
     if final_ok and not frozen:
