@@ -121,12 +121,13 @@ def find_small_triangles_device(g: dict, threshold: float):
     int32 surface indices) reproduces np.sort; no dedup pass. Consumed by gather_h_configs_warp_device
     with no h2d re-upload."""
     dev = g["device"]
-    n_s = int(g["n_used"].numpy()[1])
-    buf = _ensure_tri_buf(g, n_s)        # >= n_s so the <=1-emit-per-surface scan never overflows
-    if n_s == 0:
-        return buf["keys"], 0
+    # Scan over cap_s (host-known, NO sync) rather than the live count n_used[1] (a per-round d2h
+    # readback): dead surfaces are masked by surf_alive in the kernel and emit nothing, so the
+    # candidate set is byte-identical -- this just drops one of the three per-round host syncs.
+    cap_s = g["cap_s"]
+    buf = _ensure_tri_buf(g, cap_s)      # >= cap_s so the <=1-emit-per-surface scan never overflows
     buf["count"].zero_()
-    wp.launch(scan_small_triangles_kernel, dim=n_s, device=dev, inputs=[
+    wp.launch(scan_small_triangles_kernel, dim=cap_s, device=dev, inputs=[
         g["vert_pos"], g["surf_alive"], g["s2v"], g["s2v_len"], g["s2b"],
         wp.float64(threshold), buf["keys"], buf["count"]])
     wp.synchronize_device(dev)
@@ -409,14 +410,15 @@ def find_short_edges_device(g: dict, threshold: float):
     dims + overflow-grow). Bit-identical: the dedup is np.unique reproduced on-device (int64
     lex-sort of v10*STRIDE+v11, mark-first + array_scan + scatter)."""
     dev = g["device"]
-    n_s = int(g["n_used"].numpy()[1])               # live surfaces -> per-surface scan dim
+    # Scan over cap_s (host-known, NO sync) rather than the live count n_used[1] (a per-round d2h
+    # readback): dead surfaces are masked by surf_alive in the kernel and emit nothing, so the
+    # emitted set is byte-identical -- this drops one of the three per-round host syncs.
+    cap_s = g["cap_s"]
     buf = _ensure_detect_buf(g, 0)
-    if n_s == 0:
-        return buf["cand_v10"], buf["cand_v11"], 0
 
     def _scan(b):                                   # reset count, emit short edges; return raw k
         b["count"].zero_()
-        wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[
+        wp.launch(scan_short_edges_kernel, dim=cap_s, device=dev, inputs=[
             g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
             wp.float64(threshold), b["out_v10"], b["out_v11"], b["count"]])
         wp.synchronize_device(dev)
