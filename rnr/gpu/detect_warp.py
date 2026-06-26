@@ -24,6 +24,7 @@ from typing import List, Optional, Set, Tuple
 import numpy as np
 
 import warp as wp
+from warp.utils import array_scan, radix_sort_pairs
 
 from .device_mesh import PaddedMesh
 from .reconnect_csr import HCfgIdx, ICfgIdx
@@ -218,6 +219,67 @@ def filter_interior_short_edges_kernel(
         keep[i] = wp.int32(0)
 
 
+# --------------------------------------------------------------------------------------
+# device-resident dedup+lex-sort: reproduce np.unique(axis=0) ON THE GPU so the candidate
+# list never round-trips to host (find_short_edges_device). Pack (v10,v11) into one int64
+# key v10*STRIDE+v11 (STRIDE > any vertex slot) -> radix_sort_pairs gives lex-ascending order
+# == np.unique(axis=0); a mark-first + array_scan + scatter then dedups deterministically.
+# --------------------------------------------------------------------------------------
+_KEY_STRIDE = wp.constant(wp.int64(1 << 32))     # > any vertex slot index (cap_v << 2^32)
+_SENTINEL_KEY = wp.constant(wp.int64(1 << 62))   # filtered-out edges -> sort to the end, never emitted
+
+
+@wp.kernel
+def build_short_edge_keys_kernel(
+        out_v10: wp.array(dtype=wp.int32), out_v11: wp.array(dtype=wp.int32),
+        keep: wp.array(dtype=wp.int32),
+        keys: wp.array(dtype=wp.int64), values: wp.array(dtype=wp.int32)):
+    """Pack each raw candidate edge into a sortable int64 key = v10*STRIDE + v11 (v10<v11
+    already canonical from the scan); interior-FILTERED-OUT edges (keep==0) get _SENTINEL_KEY
+    so the lex sort drops them to the tail where mark_first never emits them. `values[i]=i`
+    rides along the stable radix sort so the scatter can read the unpermuted (out_v10,out_v11)."""
+    i = wp.tid()
+    values[i] = i
+    if keep[i] == 1:
+        keys[i] = wp.int64(out_v10[i]) * _KEY_STRIDE + wp.int64(out_v11[i])
+    else:
+        keys[i] = _SENTINEL_KEY
+
+
+@wp.kernel
+def mark_first_kernel(keys: wp.array(dtype=wp.int64), is_first: wp.array(dtype=wp.int32)):
+    """After the lex sort, flag the FIRST occurrence of each distinct (non-sentinel) key --
+    the dedup half of np.unique. Equal rows are adjacent post-sort, so one flag per distinct
+    edge; sentinels (filtered-out) are never flagged."""
+    j = wp.tid()
+    kj = keys[j]
+    if kj == _SENTINEL_KEY:
+        is_first[j] = 0
+    elif j == 0:
+        is_first[j] = 1
+    elif keys[j - 1] != kj:
+        is_first[j] = 1
+    else:
+        is_first[j] = 0
+
+
+@wp.kernel
+def scatter_unique_kernel(
+        values: wp.array(dtype=wp.int32), is_first: wp.array(dtype=wp.int32),
+        out_pos: wp.array(dtype=wp.int32),
+        out_v10: wp.array(dtype=wp.int32), out_v11: wp.array(dtype=wp.int32),
+        c_v10: wp.array(dtype=wp.int32), c_v11: wp.array(dtype=wp.int32)):
+    """Scatter each flagged distinct edge to its lex-rank slot (inclusive-scan position - 1),
+    reading the original (v10,v11) via the sort-permuted index `values[j]`. Result c_v10/c_v11
+    [0,M) is the (v10,v11)-ascending deduped set -- byte-equal to np.unique(axis=0)."""
+    j = wp.tid()
+    if is_first[j] == 1:
+        idx = out_pos[j] - 1
+        orig = values[j]
+        c_v10[idx] = out_v10[orig]
+        c_v11[idx] = out_v11[orig]
+
+
 _DETECT_BUF_START = 8192   # the actual emit k is ~150 (max seen ~222); start small, grow on overflow
 
 
@@ -235,8 +297,12 @@ def _ensure_detect_buf(g: dict, cap: int) -> dict:
     dev = g["device"]
     newcap = max(cap, _DETECT_BUF_START, (buf["cap"] * 2 if buf is not None else 0))
     z = lambda: wp.zeros(newcap, dtype=wp.int32, device=dev)
+    # keys/values feed radix_sort_pairs, which needs 2*count slots of scratch (count<=cap).
     buf = dict(cap=newcap, out_v10=z(), out_v11=z(), keep=z(),
-               count=wp.zeros(1, dtype=wp.int32, device=dev))
+               count=wp.zeros(1, dtype=wp.int32, device=dev),
+               keys=wp.zeros(2 * newcap, dtype=wp.int64, device=dev),
+               values=wp.zeros(2 * newcap, dtype=wp.int32, device=dev),
+               is_first=z(), out_pos=z(), cand_v10=z(), cand_v11=z())
     g["_detect_buf"] = buf
     return buf
 
@@ -279,6 +345,59 @@ def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     # lexicographically -> the exact canonical (v10,v11)-ascending interior-filtered deduped set the
     # host trigger (find_short_edges_csr) produces. (Dedup + interior filter moved off the scan.)
     return np.unique(np.stack([v10, v11], axis=1).astype(np.int32), axis=0)
+
+
+def find_short_edges_device(g: dict, threshold: float):
+    """FULLY DEVICE-RESIDENT [I] trigger detect. Returns (cand_v10, cand_v11, M): cand_v10/
+    cand_v11 are DEVICE int32 arrays whose first M entries are the canonical (v10,v11)-ascending
+    interior-filtered deduped short edges -- the SAME set AND order as find_short_edges_warp's
+    host np.unique(axis=0), but the candidate list NEVER leaves the device (only the scalar count
+    M is read back, to size the downstream gather/reserve/apply launches).
+
+    Removes, per I->H round vs find_short_edges_warp: the keep[:k] + out_v10/out_v11[:k] d2h
+    reads and the host np.unique; the gather then consumes these device arrays directly
+    (gather_i_configs_warp_device) so the h2d candidate re-upload is gone too. Net per round:
+    ~3 serializing host syncs -> 1 (n_s, k, M readbacks; the scan still needs k for the launch
+    dims + overflow-grow). Bit-identical: the dedup is np.unique reproduced on-device (int64
+    lex-sort of v10*STRIDE+v11, mark-first + array_scan + scatter)."""
+    dev = g["device"]
+    n_s = int(g["n_used"].numpy()[1])               # live surfaces -> per-surface scan dim
+    buf = _ensure_detect_buf(g, 0)
+    if n_s == 0:
+        return buf["cand_v10"], buf["cand_v11"], 0
+
+    def _scan(b):                                   # reset count, emit short edges; return raw k
+        b["count"].zero_()
+        wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[
+            g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
+            wp.float64(threshold), b["out_v10"], b["out_v11"], b["count"]])
+        wp.synchronize_device(dev)
+        return int(b["count"].numpy()[0])
+
+    k = _scan(buf)
+    if k > buf["cap"]:                              # bounds-guarded scan overflowed -> grow + rescan
+        buf = _ensure_detect_buf(g, k)
+        k = _scan(buf)
+    if k == 0:
+        return buf["cand_v10"], buf["cand_v11"], 0
+
+    out_v10, out_v11, keep = buf["out_v10"], buf["out_v11"], buf["keep"]
+    keys, values, is_first = buf["keys"], buf["values"], buf["is_first"]
+    out_pos, cand_v10, cand_v11 = buf["out_pos"], buf["cand_v10"], buf["cand_v11"]
+
+    wp.launch(filter_interior_short_edges_kernel, dim=k, device=dev,   # keep stays on device
+              inputs=[out_v10, g["v2s"], g["v2s_len"], g["s2b"], keep])
+    wp.launch(build_short_edge_keys_kernel, dim=k, device=dev,         # pack (v10,v11) -> int64 key
+              inputs=[out_v10, out_v11, keep, keys, values])
+    radix_sort_pairs(keys, values, k)                                 # lex-ascending == np.unique order
+    wp.launch(mark_first_kernel, dim=k, device=dev, inputs=[keys, is_first])   # dedup-adjacent flag
+    array_scan(is_first[:k], out_pos[:k], inclusive=True)             # flag -> output slot (inclusive)
+    M = int(out_pos[k - 1:k].numpy()[0])             # distinct count = last inclusive-scan value
+    if M == 0:                                       # every candidate filtered out
+        return cand_v10, cand_v11, 0
+    wp.launch(scatter_unique_kernel, dim=k, device=dev,
+              inputs=[values, is_first, out_pos, out_v10, out_v11, cand_v10, cand_v11])
+    return cand_v10, cand_v11, M
 
 
 def short_edge_trigger_host(pm: PaddedMesh, threshold: float) -> Set[Tuple[int, int]]:

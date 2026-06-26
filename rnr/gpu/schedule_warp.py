@@ -31,9 +31,11 @@ import numpy as np
 import warp as wp
 
 from .detect_warp import (detect_short_edges_hybrid, detect_small_triangles_hybrid,
-                          find_short_edges_warp, find_small_triangles_warp)
+                          find_short_edges_device, find_short_edges_warp,
+                          find_small_triangles_warp)
 from .device_mesh import PaddedMesh
-from .gather_warp import _ensure_gather_buf, gather_h_configs_warp, gather_i_configs_warp
+from .gather_warp import (_ensure_gather_buf, gather_h_configs_warp, gather_i_configs_warp,
+                          gather_i_configs_warp_device)
 from .reconnect_csr import HCfgIdx, ICfgIdx
 from .reconnect_warp import (apply_h_to_i_batch_warp, apply_h_to_i_device_warp,
                             apply_i_to_h_batch_warp, apply_i_to_h_device_warp)
@@ -492,10 +494,11 @@ def reconnect_sweep_warp_device(g: dict, threshold: float, dl_th: Optional[float
                                 max_rounds: int = 64) -> Dict[str, object]:
     """FULLY-ON-DEVICE forward I->H sweep (Option A: device-resident). Each round:
 
-      1. DETECT  -- find_short_edges_warp: GPU one-thread-per-vertex scan; the only data that
-                    leaves the device is the small (M,2) candidate-edge list, in canonical
-                    (v10,v11)-ascending order (so the lowest-id-wins reservation is deterministic).
-                    M==0 -> EMPTY-STEP FAST PATH: skip the gather/reserve/apply entirely.
+      1. DETECT  -- find_short_edges_device: GPU per-surface scan + interior filter + an ON-DEVICE
+                    dedup/lex-sort (int64-key radix_sort + array_scan, reproducing np.unique(axis=0));
+                    the candidate edges stay on the device (canonical (v10,v11)-ascending so the
+                    lowest-id-wins reservation is deterministic) and only the scalar count M is read
+                    back. M==0 -> EMPTY-STEP FAST PATH: skip the gather/reserve/apply entirely.
       2. GATHER  -- gather_i_configs_warp: per-candidate [I]-neighbourhood + fused Condition-4 veto,
                     emitting PACKED DEVICE ARRAYS (valid/caps/side/arms/top/bot). These stay on the
                     device -- they are NOT round-tripped to host ICfgIdx objects.
@@ -520,14 +523,14 @@ def reconnect_sweep_warp_device(g: dict, threshold: float, dl_th: Optional[float
     round_sizes: List[int] = []
     rounds = 0
     while rounds < max_rounds:
-        edges = find_short_edges_warp(g, threshold)       # (M,2) (v10,v11)-ascending; only host data
-        if len(edges) == 0:                               # empty-step fast path
+        c_v10, c_v11, m = find_short_edges_device(g, threshold)   # DEVICE (v10,v11)-ascending + count M
+        if m == 0:                                        # empty-step fast path (no host candidate copy)
             break
-        buf = _ensure_gather_buf(g, "_i_gather_buf", len(edges))  # reused scratch (no per-round alloc/fill)
-        gathered = gather_i_configs_warp(g, edges, device=dev, buf=buf)   # packed DEVICE arrays + fused veto
+        buf = _ensure_gather_buf(g, "_i_gather_buf", m)   # reused scratch (no per-round alloc/fill)
+        gathered = gather_i_configs_warp_device(g, c_v10, c_v11, m, device=dev, buf=buf)  # device-in: no h2d
         won = reserve_i_won_device(g, gathered)           # device won mask (skips invalid rows)
         wp.synchronize_device(dev)
-        n_win = int(won.numpy().sum())                    # the loop's only readback: winner count
+        n_win = int(won.numpy().sum())                    # winner count (+ M in detect = the 2 round readbacks)
         if n_win == 0:                                    # all candidates vetoed / lost -> done
             break
         apply_i_to_h_device_warp(g, gathered, won, dl_th)  # parallel surgery from device arrays

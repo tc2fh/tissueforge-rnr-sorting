@@ -283,6 +283,26 @@ def gather_i_configs_warp(g: dict, cand_edges: np.ndarray, device=None, buf: dic
     return out
 
 
+def gather_i_configs_warp_device(g: dict, c_v10, c_v11, m: int, device=None, buf: dict = None) -> dict:
+    """Same as gather_i_configs_warp, but the candidate edges are already DEVICE int32 arrays
+    (c_v10/c_v11 from detect_warp.find_short_edges_device, valid in [0,m)) -- so the host->device
+    candidate upload is skipped entirely. `buf` (from _ensure_gather_buf, sized >= m) is required
+    here (the device sweep always reuses one) and `m > 0` is guaranteed by the caller. Returns the
+    same packed-device dict shape as gather_i_configs_warp's reuse path; the [:m] slices alias the
+    detect/gather buffers and feed reserve+apply with no host round-trip."""
+    dev = g["device"] if device is None else device
+    cv10, cv11 = c_v10[:m], c_v11[:m]
+    wp.launch(gather_i_kernel, dim=m, device=dev, inputs=[
+        g["vert_alive"], g["v2s"], g["v2s_len"], g["surf_alive"], g["s2v"], g["s2v_len"],
+        g["s2b"], g["b2s"], g["b2s_len"], cv10, cv11,
+        buf["valid"], buf["cap_top"], buf["cap_bot"], buf["side"],
+        buf["arm_side"], buf["arm_otop"], buf["arm_obot"], buf["top"], buf["bot"]])
+    return dict(v10=cv10, v11=cv11, valid=buf["valid"][:m], cap_top=buf["cap_top"][:m],
+                cap_bot=buf["cap_bot"][:m], side=buf["side"][:m], arm_side=buf["arm_side"][:m],
+                arm_otop=buf["arm_otop"][:m], arm_obot=buf["arm_obot"][:m],
+                top=buf["top"][:m], bot=buf["bot"][:m])
+
+
 def gather_i_configs_to_list(g: dict, cand_edges: np.ndarray, device=None):
     """Run the device gather and reconstruct the valid (v10, v11, ICfgIdx) list on the host --
     O(candidates) data only, NO PaddedMesh.from_warp / O(mesh) copy. The host ICfgIdx objects let

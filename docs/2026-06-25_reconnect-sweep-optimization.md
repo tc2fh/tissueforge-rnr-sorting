@@ -102,3 +102,14 @@ All gates green (132-test gate; 79 GPU tests incl. round-1 fingerprint equivalen
 2. **Dirty-region re-scan.** The sweep re-scans the WHOLE mesh after every applied round; only the
    reconnection neighbourhoods gain new short edges. Exact, but only helps multi-round (minority) steps.
 3. **CUDA graphs / `force`-kernel fusion** — secondary; `force` is real work, low ROI.
+
+## Update (later sessions — these "next levers" are now superseded; see memory `reconnect-sweep-scan-bottleneck`)
+- **Lever 1 (skip-scan) is DEAD** — measured: the foam ALWAYS has a sub-Lth edge (0/3000 steps had
+  `found==0`); short edges persist but are mostly Condition-4-BLOCKED, so the scan can never be skipped.
+  Also the in-kernel `min_edge` atomic perturbs FP codegen ~1 ULP → breaks bit-identicality.
+- **What WAS done instead (all bit-identical):** compact double-buffer (3.56→0.19 ms at n=16), detect
+  scan-buffer reuse + tighten, and **device-resident I→H detect (2026-06-25)** — `find_short_edges_device`
+  keeps the candidate list on-device through the round (on-device dedup/lex-sort reproducing
+  `np.unique(axis=0)` via int64-key `radix_sort_pairs` + `array_scan`; only the count M is read back),
+  consumed by `gather_i_configs_warp_device` with no h2d. Concurrency K=16 throughput +12% (202→226
+  sim-steps/s), util 43→46%; single-sim per-step −4%. 133-gate green; 20k recon 4010/3028, het@10k=0.4638.

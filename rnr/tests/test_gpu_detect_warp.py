@@ -112,6 +112,27 @@ def test_i_scan_matches_host_trigger(vsolver):
     assert validated <= gpu_set, "a validated [I] edge was missed by the GPU trigger scan"
 
 
+def test_i_device_detect_matches_host_unique(vsolver):
+    """find_short_edges_device (on-device dedup/lex-sort) returns the SAME (M,2) candidate array
+    as find_short_edges_warp (host np.unique) -- byte-for-byte, both the set AND the order. This
+    is the bit-identity guarantee the device-resident I->H sweep (reconnect_sweep_warp_device)
+    rests on: the candidate list never leaves the device, yet the lowest-id-wins reservation
+    downstream sees the identical canonical (v10,v11)-ascending order."""
+    dev = _cuda_or_skip()
+    _tf, _tfv, stype, btype = vsolver
+    bodies = H.build_kelvin_block(stype, btype, n=4, span=8.0, origin=(8., 8., 8.))
+    pm = PaddedMesh.from_csr(cm.extract_csr(bodies))
+
+    g = pm.to_warp(device=dev)
+    host = dw.find_short_edges_warp(g, threshold=1.0)               # (M,2) host np.unique(axis=0)
+    c_v10, c_v11, m = dw.find_short_edges_device(g, threshold=1.0)  # on-device dedup/sort + count
+    device = (np.stack([c_v10[:m].numpy(), c_v11[:m].numpy()], axis=1).astype(np.int32)
+              if m else np.zeros((0, 2), np.int32))
+    assert host.shape[0] > 0, "test mesh has no short edges -- equivalence check would be vacuous"
+    assert m == host.shape[0], f"device M={m} != host M={host.shape[0]}"
+    assert np.array_equal(device, host), "device detect != host np.unique (set or order differs)"
+
+
 def test_i_hybrid_detect_matches_host(vsolver):
     """detect_short_edges_hybrid (GPU scan + host gather) == find_short_edges_csr as a set AND
     in order, and the hybrid configs drive a clean conflict-free parallel apply."""
