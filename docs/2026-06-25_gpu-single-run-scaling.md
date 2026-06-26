@@ -118,3 +118,12 @@ syncs per step, so this is round-robin, not CUDA-stream-parallel). Repro:
 **Bottom line:** ~143 n=16 sims fit in 8 GB, but the **throughput sweet spot is ~16–48 concurrent**
 (max efficiency, 3–4 GB, big headroom). More concurrency ≠ more total throughput — the GPU's n=16
 capacity is ~122 sim-steps/s regardless, gated by the per-step host sync.
+
+> **UPDATE 2026-06-26 (per-step buffer-reuse optimizations):** compact + find_short_edges scan
+> buffer-reuse (commits `a5f277d`, `adbb3be`) cut the n=16 per-step ~9.5→4.6 ms and lifted the
+> concurrency K=16 aggregate **122→215 sim-steps/s (+76%)** with util **34→42%** (the ceiling moved).
+> TRADEOFF: the reused scratch is now PERSISTENT per-sim (~150 MB/sim vs 38), so **fewer sims fit in
+> 8 GB** (~30 vs 143) — but aggregate throughput in 8 GB is higher (215 vs 122 sim-steps/s) with far
+> fewer sims. The "143 in 8 GB" figure above is the PRE-optimization baseline. See the
+> `reconnect-sweep-scan-bottleneck` memory for the per-phase breakdown + the remaining device-resident-
+> round lever (kill detect's 3 host readbacks).
