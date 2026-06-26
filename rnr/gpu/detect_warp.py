@@ -217,6 +217,24 @@ def filter_interior_short_edges_kernel(
         keep[i] = wp.int32(0)
 
 
+def _ensure_detect_buf(g: dict, cap: int) -> dict:
+    """Get-or-grow the reusable scan buffers (out_v10/out_v11/keep sized >= cap + the 1-int count),
+    stashed on g['_detect_buf']. Per-call `wp.zeros(cap)` of the two cap=n_s*MAX_RING (~4.2M-int)
+    emit arrays was 59% of the early-phase detect cost (scratchpad/prof_detect.py); the scan writes
+    only [0,count) and the host reads only [:k], so stale tail entries are never consumed -> reuse
+    is bit-identical, needing only a count reset. Grows x2 (mirrors _ensure_gather_buf)."""
+    buf = g.get("_detect_buf")
+    if buf is not None and buf["cap"] >= cap:
+        return buf
+    dev = g["device"]
+    newcap = max(cap, 256, (buf["cap"] * 2 if buf is not None else 0))
+    z = lambda: wp.zeros(newcap, dtype=wp.int32, device=dev)
+    buf = dict(cap=newcap, out_v10=z(), out_v11=z(), keep=z(),
+               count=wp.zeros(1, dtype=wp.int32, device=dev))
+    g["_detect_buf"] = buf
+    return buf
+
+
 def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     """GPU parallel Condition-2 trigger scan for [I] sites. Returns an (M,2) int32 array of
     candidate short edges (v10, v11) sorted by (v10, v11), interior-filtered + deduped, read
@@ -227,9 +245,9 @@ def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     if n_s == 0:
         return np.zeros((0, 2), np.int32)
     cap = n_s * g["MAX_RING"]                        # safe bound: <= one emit per ring edge per surface
-    out_v10 = wp.zeros(cap, dtype=wp.int32, device=dev)
-    out_v11 = wp.zeros(cap, dtype=wp.int32, device=dev)
-    count = wp.zeros(1, dtype=wp.int32, device=dev)
+    buf = _ensure_detect_buf(g, cap)                # REUSED buffers (no per-call cap-sized alloc)
+    out_v10, out_v11, keep, count = buf["out_v10"], buf["out_v11"], buf["keep"], buf["count"]
+    count.zero_()                                   # reset the atomic emit counter (the only reset needed)
     wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[     # cheap per-surface length trigger
         g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
         wp.float64(threshold), out_v10, out_v11, count])
@@ -237,11 +255,10 @@ def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     k = int(count.numpy()[0])
     if k == 0:
         return np.zeros((0, 2), np.int32)
-    keep = wp.zeros(k, dtype=wp.int32, device=dev)                       # interior filter, off-hot-path
-    wp.launch(filter_interior_short_edges_kernel, dim=k, device=dev,
+    wp.launch(filter_interior_short_edges_kernel, dim=k, device=dev,    # interior filter, off-hot-path
               inputs=[out_v10, g["v2s"], g["v2s_len"], g["s2b"], keep])
     wp.synchronize_device(dev)
-    mask = keep.numpy().astype(bool)
+    mask = keep[:k].numpy().astype(bool)
     v10 = out_v10[:k].numpy()[mask]                  # slice ON DEVICE first -> copy only k, not cap
     v11 = out_v11[:k].numpy()[mask]
     if v10.size == 0:
