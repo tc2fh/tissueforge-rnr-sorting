@@ -94,11 +94,20 @@ def orient_repair_warp(g: dict, max_iter: int = 4) -> int:
     dev = g["device"]
     cap_s = g["cap_s"]
     nb = g["nb"]
+    # Persistent scratch on `g` (alloc-free for CUDA-graph capture, P1; reset in place below ->
+    # byte-identical to the old per-call wp.zeros/clone). snw must be SEPARATE from _geo_snorm: it
+    # is negated in place on flips, and _geo_snorm is the shared geometry buffer.
+    if "_orient_snw" not in g:
+        g["_orient_snw"] = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+        g["_orient_clo"] = wp.zeros(nb, dtype=wp.vec3d, device=dev)
+        g["_orient_flip"] = wp.zeros(cap_s, dtype=wp.int32, device=dev)
+        g["_orient_counter"] = wp.zeros(1, dtype=wp.int32, device=dev)
     gw = compute_surface_geom_warp(g)                # ONLY snorm is needed -> skip the body kernel
-    snw = wp.clone(gw["snorm"])                      # working snorm (negated in place on flips)
-    clo = wp.zeros(nb, dtype=wp.vec3d, device=dev)
-    flip = wp.zeros(cap_s, dtype=wp.int32, device=dev)
-    counter = wp.zeros(1, dtype=wp.int32, device=dev)
+    snw = g["_orient_snw"]
+    wp.copy(snw, gw["snorm"])                        # working snorm (negated in place on flips)
+    clo = g["_orient_clo"]
+    flip = g["_orient_flip"]
+    counter = g["_orient_counter"]
     total = 0
     for _ in range(max_iter):
         clo.zero_()

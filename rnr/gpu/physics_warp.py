@@ -313,22 +313,42 @@ def upload_phys(state: PhysState, device) -> dict:
     )
 
 
+def _ensure_step_buffers(g: dict) -> None:
+    """Lazily allocate the per-step geometry + force output buffers ONCE on `g` (reused every step,
+    zeroed in place). The mempool already makes per-call wp.zeros free (measured 0 latency), so this
+    is NOT a speed change -- it is the CUDA-GRAPH-CAPTURE PREREQUISITE: graph capture forbids memory
+    allocation inside the captured region, so the static step path must own its scratch up front
+    (docs/2026-06-26_cuda-graph-experiment-scope.md, P1). Surface buffers are shared by
+    compute_geometry_warp and compute_surface_geom_warp (the latter runs in orient, after the former
+    is consumed)."""
+    if "_geo_scent" in g:
+        return
+    dev, cap_s, nb, cap_v = g["device"], g["cap_s"], g["nb"], g["cap_v"]
+    g["_geo_scent"] = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    g["_geo_sarea"] = wp.zeros(cap_s, dtype=wp.float64, device=dev)
+    g["_geo_snorm"] = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    g["_geo_bvol"] = wp.zeros(nb, dtype=wp.float64, device=dev)
+    g["_geo_barea"] = wp.zeros(nb, dtype=wp.float64, device=dev)
+    g["_geo_bcent"] = wp.zeros(nb, dtype=wp.vec3d, device=dev)
+    g["_geo_borient"] = wp.zeros(nb, dtype=wp.float64, device=dev)
+    g["_force"] = wp.zeros(cap_v, dtype=wp.vec3d, device=dev)
+
+
 def compute_geometry_warp(g: dict) -> dict:
     """Launch the geometry kernels; return device arrays scent/sarea/snorm/bvol/barea/
-    bcent/borient. Box is read from g['box'] (a wp.vec3d), set by physics_state_to_warp."""
-    dev = g["device"]
-    cap_s, nb = g["cap_s"], g["nb"]
-    box = g["box"]
-    scent = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
-    sarea = wp.zeros(cap_s, dtype=wp.float64, device=dev)
-    snorm = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    bcent/borient. Box is read from g['box'] (a wp.vec3d), set by physics_state_to_warp.
+    Writes into persistent buffers on `g` (zeroed in place -> byte-identical to the old per-call
+    wp.zeros; alloc-free for graph capture). The kernels skip dead slots, so the zero_ keeps their
+    pad at 0 exactly as wp.zeros did."""
+    _ensure_step_buffers(g)
+    dev, cap_s, nb, box = g["device"], g["cap_s"], g["nb"], g["box"]
+    scent, sarea, snorm = g["_geo_scent"], g["_geo_sarea"], g["_geo_snorm"]
+    bvol, barea, bcent, borient = g["_geo_bvol"], g["_geo_barea"], g["_geo_bcent"], g["_geo_borient"]
+    scent.zero_(); sarea.zero_(); snorm.zero_()
     wp.launch(surface_geom_kernel, dim=cap_s, device=dev,
               inputs=[g["vert_pos"], g["s2v"], g["s2v_len"], g["surf_alive"], box],
               outputs=[scent, sarea, snorm])
-    bvol = wp.zeros(nb, dtype=wp.float64, device=dev)
-    barea = wp.zeros(nb, dtype=wp.float64, device=dev)
-    bcent = wp.zeros(nb, dtype=wp.vec3d, device=dev)
-    borient = wp.zeros(nb, dtype=wp.float64, device=dev)
+    bvol.zero_(); barea.zero_(); bcent.zero_(); borient.zero_()
     wp.launch(body_geom_kernel, dim=nb, device=dev,
               inputs=[g["b2s"], g["b2s_len"], g["s2b"], g["body_alive"],
                       scent, sarea, snorm, box],
@@ -339,16 +359,14 @@ def compute_geometry_warp(g: dict) -> dict:
 
 def compute_surface_geom_warp(g: dict) -> dict:
     """Surface-only geometry (centroid/area/UNNORMALIZED normal); runs ONLY surface_geom_kernel,
-    skipping the body kernel + its 4 allocs. For callers that need just snorm (orient_repair_warp).
-    The returned snorm is byte-identical to compute_geometry_warp's (same kernel, same inputs); the
-    body kernel never feeds back into the surface kernel, so dropping it is arithmetic-preserving.
-    (Measured ~46% of full geometry at n=16; allocs are free here -- the mempool zeros for nothing.)"""
-    dev = g["device"]
-    cap_s = g["cap_s"]
-    box = g["box"]
-    scent = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
-    sarea = wp.zeros(cap_s, dtype=wp.float64, device=dev)
-    snorm = wp.zeros(cap_s, dtype=wp.vec3d, device=dev)
+    skipping the body kernel. For callers that need just snorm (orient_repair_warp). The returned
+    snorm is byte-identical to compute_geometry_warp's (same kernel, same inputs); the body kernel
+    never feeds back into the surface kernel, so dropping it is arithmetic-preserving. Reuses the
+    shared persistent surface buffers (alloc-free for capture)."""
+    _ensure_step_buffers(g)
+    dev, cap_s, box = g["device"], g["cap_s"], g["box"]
+    scent, sarea, snorm = g["_geo_scent"], g["_geo_sarea"], g["_geo_snorm"]
+    scent.zero_(); sarea.zero_(); snorm.zero_()
     wp.launch(surface_geom_kernel, dim=cap_s, device=dev,
               inputs=[g["vert_pos"], g["s2v"], g["s2v_len"], g["surf_alive"], box],
               outputs=[scent, sarea, snorm])
@@ -356,9 +374,12 @@ def compute_surface_geom_warp(g: dict) -> dict:
 
 
 def compute_forces_warp(g: dict, geom_w: dict, params: PhysParams, phys: dict) -> wp.array:
-    """Launch the force kernel; return a device (cap_v,) vec3d force array."""
+    """Launch the force kernel; return a device (cap_v,) vec3d force array (a persistent buffer on
+    `g`, zeroed in place -> byte-identical to the old per-call wp.zeros; alloc-free for capture)."""
+    _ensure_step_buffers(g)
     dev = g["device"]
-    f = wp.zeros(g["cap_v"], dtype=wp.vec3d, device=dev)
+    f = g["_force"]
+    f.zero_()
     wp.launch(force_kernel, dim=g["cap_v"], device=dev,
               inputs=[g["vert_pos"], g["vert_alive"], g["s2v"], g["s2v_len"], g["s2b"],
                       g["v2s"], g["v2s_len"], geom_w["scent"], geom_w["snorm"],
