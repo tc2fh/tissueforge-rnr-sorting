@@ -197,8 +197,9 @@ def scan_short_edges_kernel(
             continue
         if wp.length(vert_pos[v] - vert_pos[w]) < threshold:
             idx = wp.atomic_add(out_count, 0, 1)
-            out_v10[idx] = v
-            out_v11[idx] = w
+            if idx < out_v10.shape[0]:           # bounds guard: count stays exact on overflow so the
+                out_v10[idx] = v                 # caller (find_short_edges_warp) grows the buffer to
+                out_v11[idx] = w                 # fit k and rescans -> small persistent buffer, no OOB.
 
 
 @wp.kernel
@@ -217,17 +218,22 @@ def filter_interior_short_edges_kernel(
         keep[i] = wp.int32(0)
 
 
+_DETECT_BUF_START = 8192   # the actual emit k is ~150 (max seen ~222); start small, grow on overflow
+
+
 def _ensure_detect_buf(g: dict, cap: int) -> dict:
     """Get-or-grow the reusable scan buffers (out_v10/out_v11/keep sized >= cap + the 1-int count),
-    stashed on g['_detect_buf']. Per-call `wp.zeros(cap)` of the two cap=n_s*MAX_RING (~4.2M-int)
-    emit arrays was 59% of the early-phase detect cost (scratchpad/prof_detect.py); the scan writes
-    only [0,count) and the host reads only [:k], so stale tail entries are never consumed -> reuse
-    is bit-identical, needing only a count reset. Grows x2 (mirrors _ensure_gather_buf)."""
+    stashed on g['_detect_buf']. Per-call `wp.zeros(...)` of the emit arrays was 59% of the
+    early-phase detect cost (scratchpad/prof_detect.py); the scan writes only [0,count) and the host
+    reads only [:k], so stale tail entries are never consumed -> reuse is bit-identical, needing only
+    a count reset. Sized to the ~150-entry ACTUAL emit (not the n_s*MAX_RING ~4.2M worst case): starts
+    at _DETECT_BUF_START and grows x2 on overflow (find_short_edges_warp rescans), keeping the
+    persistent per-sim footprint at ~KB not ~50 MB (matters under heavy concurrency)."""
     buf = g.get("_detect_buf")
     if buf is not None and buf["cap"] >= cap:
         return buf
     dev = g["device"]
-    newcap = max(cap, 256, (buf["cap"] * 2 if buf is not None else 0))
+    newcap = max(cap, _DETECT_BUF_START, (buf["cap"] * 2 if buf is not None else 0))
     z = lambda: wp.zeros(newcap, dtype=wp.int32, device=dev)
     buf = dict(cap=newcap, out_v10=z(), out_v11=z(), keep=z(),
                count=wp.zeros(1, dtype=wp.int32, device=dev))
@@ -244,15 +250,21 @@ def find_short_edges_warp(g: dict, threshold: float) -> np.ndarray:
     n_s = int(g["n_used"].numpy()[1])               # tiny readback (live surfaces; per-surface scan)
     if n_s == 0:
         return np.zeros((0, 2), np.int32)
-    cap = n_s * g["MAX_RING"]                        # safe bound: <= one emit per ring edge per surface
-    buf = _ensure_detect_buf(g, cap)                # REUSED buffers (no per-call cap-sized alloc)
-    out_v10, out_v11, keep, count = buf["out_v10"], buf["out_v11"], buf["keep"], buf["count"]
-    count.zero_()                                   # reset the atomic emit counter (the only reset needed)
-    wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[     # cheap per-surface length trigger
-        g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
-        wp.float64(threshold), out_v10, out_v11, count])
-    wp.synchronize_device(dev)
-    k = int(count.numpy()[0])
+
+    def _scan(buf):                                 # reset count, emit short edges into buf; return k
+        buf["count"].zero_()
+        wp.launch(scan_short_edges_kernel, dim=n_s, device=dev, inputs=[  # cheap per-surface length trigger
+            g["vert_pos"], g["vert_alive"], g["surf_alive"], g["s2v"], g["s2v_len"],
+            wp.float64(threshold), buf["out_v10"], buf["out_v11"], buf["count"]])
+        wp.synchronize_device(dev)
+        return int(buf["count"].numpy()[0])
+
+    buf = _ensure_detect_buf(g, 0)                  # small REUSED buffer (no per-call cap-sized alloc)
+    k = _scan(buf)
+    if k > buf["cap"]:                              # buffer overflowed (the kernel bounds-guards writes)
+        buf = _ensure_detect_buf(g, k)             # -> grow to fit the exact count + rescan (rare)
+        k = _scan(buf)
+    out_v10, out_v11, keep = buf["out_v10"], buf["out_v11"], buf["keep"]
     if k == 0:
         return np.zeros((0, 2), np.int32)
     wp.launch(filter_interior_short_edges_kernel, dim=k, device=dev,    # interior filter, off-hot-path
