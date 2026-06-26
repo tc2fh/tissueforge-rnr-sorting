@@ -2,6 +2,74 @@
 
 **Date:** 2026-06-26 · **Status: ★ P3 RESOLVED** — full forward_step graph capture WORKS; **captured-sequential replay SATURATES at production scale (util 90% @ n=16, K=8; single-sim −33%)**. GO/NO-GO ANSWER: **C++ NOT needed for performance** — port = TF-integration milestone only. The n=10 72% was a small-n occupancy artifact; multi-stream overlap (P4) + its shared-CUB-workspace blocker are MOOT for production. (P0/capture_while/P1/P2 done; batched-driver +19%/63% superseded.) · **Branch:** `migrate/linux64-wsl2`
 
+## ★★ PRODUCTIONIZED (2026-06-26 PM) — `rnr/gpu/capture_warp.py` + the `max_rounds` THROUGHPUT LEVER
+
+The captured path is now a real, byte-identical module (`rnr/gpu/capture_warp.CapturedStep`), NOT just a
+scratchpad proto — and productionizing it surfaced a **correction to the perf story the util number hid.**
+
+**THE CORRECTION (util ≠ throughput): graph capture at the proto's `max_rounds=8` SATURATES the GPU but
+REGRESSES throughput vs the variable-round production baseline.** The fixed-R=8 path runs 8 reconnect rounds
+every step, but the variable sweep uses **≤2 applying rounds** at n=16 AND n=10, σ=0.5
+(`scratchpad/proto_roundcount.py`: I/H mean ≈1.0, max 2) — so ~6 of the 8 rounds are no-ops, each still
+paying a full detect (scan + radix_sort over CAP=8192). The 90% util is real but **includes wasted work.**
+
+| K=16, n=16 | util | agg steps/s | note |
+|---|---|---|---|
+| prod_eager (variable, real baseline) | 51% | 262 | host-sync-bound, but does minimal work |
+| captured_seq **max_rounds=8** (proto config) | 91% | **210** | saturates util, **−20% throughput** ✗ |
+| captured_seq **max_rounds=3** (lean) | **93%** | **367** | **+40% throughput** ✓ |
+
+**THE LEVER: capture with `max_rounds = (regime's max applying rounds) + 1`** (=3 for σ=0.5). Still
+byte-identical (the variable path never exceeds 2 rounds → fixed-3 == variable-8), now WITHOUT the wasted
+no-op detects → +40% ensemble throughput AND 93% util. Same at K=8 and K=16 (per-sim occupancy dominates,
+as the scope predicted). **So the go/no-go answer holds — C++ NOT needed — but the win requires `max_rounds`
+tuning, not just capture.** The handoff's "90% util → resolved" was right on the conclusion, wrong on the
+mechanism: at mr=8 the 90% was throughput-negative.
+
+**SAFETY (two device-flag guards make the perf-tuned small params bit-safe, read post-replay, no hot-loop
+sync):**
+- **`check_overflow`** — a round's deduped candidate count exceeded `MAX_CAND` (=512; observed max M=125 at
+  n=16, 4× margin) → silently-dropped candidates → not bit-identical.
+- **`check_underconverged`** — the LAST fixed round still applied a winner ⟺ the variable sweep would NOT
+  have broken (it breaks iff m==0 or n_win==0 ⟹ won.sum()==0) ⟺ `max_rounds` too small. An UNSET flag
+  GUARANTEES byte-identicality; rigor proven: mr=1 (no margin) → flag trips + trajectory diverges (het
+  0.49154**194** vs **312**), mr=3 → flag clear + byte-identical.
+
+**Validated:** byte-identical 2k AND 20k trajectories vs production at n=10 (het 0.4604 @ 20k matches the ref),
+captured-vs-production at mr=3 and mr=8 (`scratchpad/proto_fixed_traj.py`, `proto_captured_traj.py`); 134-gate
+green; the device-step-seed director (`physics_warp.set_director_step`/`_launch_director_update`, a 1-int
+device scalar bumped per replay) varies the captured RNG per step (`proto_step_seed.py`) and stays byte-
+identical eager.
+
+### ★★★ `capture_while` IMPLEMENTED (2026-06-26 PM, user-chosen) — the RECOMMENDED path: no `max_rounds` tuning
+
+The `max_rounds=3` lever above WORKS but needs per-regime tuning + the under-convergence guard. `capture_while`
+(a CUDA conditional-graph node, device-side round loop) removes both: `CapturedStep.reconnect_sweep_*_while`
+runs ONE fixed-dim round per iteration and re-reads a device `cond` (= "this round applied a winner", EXACTLY
+the variable sweep's m==0 / n_win==0 break), looping until convergence or a `max_rounds` SAFETY cap (never hit
+at ≤2 rounds). So it does EXACTLY the needed rounds — **byte-identical BY CONSTRUCTION, no tuning, no
+under-convergence guard, no wasted no-op rounds.**
+
+**THE BLOCKER it hit + the fix (the concrete "Warp-constrained" signal the scope wanted):** `wp.capture_while`'s
+conditional-graph body REJECTS memory allocation, and **`warp.utils.array_scan` (CUB) allocates a workspace**
+inside it → "unsupported operation (memory allocation)". Isolated (`scratchpad/proto_while_isolate.py`):
+`array_scan` is the ONLY offender — `radix_sort_pairs`, `wp.copy`, slicing all capture fine. Fix: replace the
+I-side dedup's `array_scan` with a single-thread serial inclusive-scan kernel (`_serial_inclusive_scan_kernel`,
+byte-identical, n=CAP≈8192 small/off-critical-path; both the fixed-R and capture_while paths use it now, both
+re-validated byte-identical). Capture needs `force_module_load=True`.
+
+**RESULT (K=16, n=16): captured capture_while = 99% util / 369.7 steps/s = +42% vs prod_eager (260)** — ties
+the mr=3 fixed-R throughput (367) but with HIGHER util and ZERO tuning/guard burden. **So `CapturedStep`
+default = `use_capture_while=True, max_rounds=8` (cap) is the production config:** byte-identical for ANY regime,
+saturating, no per-σ round-count measurement. (`max_rounds` fixed-R + the two guards remain as a validated
+fallback `use_capture_while=False`.)
+
+**REMAINING (next session): wire `CapturedStep` into the production ensemble drivers** (`run_overnight` /
+`gpu_fig_runs`) — per-sim `CapturedStep()` (capture_while default), replay per step, periodic `read_stats()`
+for the audit + the overflow flag. `scratchpad/proto_ensemble_captured.py` is the proven template. Validate the
+interval>1 prefix-graph path for dt<0.01 regimes. Multi-stream P4 stays MOOT (sequential replay already
+saturates at 99%).
+
 ## Progress (2026-06-26)
 
 - **Batched-driver intermediate TESTED** (`scratchpad/batched_driver.py`, the P0 "cheaper

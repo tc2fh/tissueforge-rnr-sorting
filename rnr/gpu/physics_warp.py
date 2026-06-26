@@ -256,17 +256,23 @@ def integrate_kernel(vert_alive: wp.array(dtype=wp.int32), force: wp.array(dtype
 
 @wp.kernel
 def director_update_kernel(body_alive: wp.array(dtype=wp.int32), rot_std: wp.float64,
-                           seed: wp.int32, key0: wp.int32,
+                           seed: wp.int32, step_dev: wp.array(dtype=wp.int32), nb: wp.int32,
                            body_director: wp.array(dtype=wp.vec3d)):
     """Active-Brownian rotational diffusion (tfMeshSolver.cpp:543-554):
     n <- normalize(n + sqrt(2*Dr*dt)*(xi - n)), xi ~ uniform on S^2. An unset director
     (|n|^2 ~ 0) is lazily seeded random-on-S^2. Statistical, NOT bit-matched to TF's mt19937;
-    the validated quantity is the decay rate (2/3)*Dr (probe_native_calibration Part B)."""
+    the validated quantity is the decay rate (2/3)*Dr (probe_native_calibration Part B).
+
+    The per-step RNG key offset key0 = step*nb is read from the DEVICE scalar step_dev[0] (not a
+    baked host int) so a CUDA-graph-captured launch varies its noise per replay: the host bumps
+    step_dev (set_director_step) between replays, OUTSIDE the capture region. Byte-identical to the
+    old host-key0 path for eager use -- step_dev[0]*nb is the same int32 as the old wp.int32(step*nb)
+    (two's-complement product), so rand_init(seed, key0+b) is unchanged."""
     b = wp.tid()
     if body_alive[b] == 0:
         return
     n = body_director[b]
-    st = wp.rand_init(seed, key0 + b)
+    st = wp.rand_init(seed, step_dev[0] * nb + b)
     if wp.dot(n, n) < wp.float64(1e-12):
         n = wp.vec3d(wp.float64(wp.randn(st)), wp.float64(wp.randn(st)), wp.float64(wp.randn(st)))
         nl = wp.length(n)
@@ -286,13 +292,36 @@ def integrate_warp(g: dict, force: wp.array, dt: float) -> None:
               inputs=[g["vert_alive"], force, wp.float64(dt), g["box"], g["vert_pos"]])
 
 
-def director_update_warp(g: dict, phys: dict, dr: float, dt: float, seed: int, step: int) -> None:
-    """Evolve every body's director by one rotational-diffusion step (mutates
-    phys['body_director'] in place). `step` makes the per-body RNG key unique across steps."""
+def set_director_step(g: dict, step: int) -> None:
+    """Write the current integration step into g['_step_dev'] (a 1-int device scalar; lazily
+    allocated). MUST run OUTSIDE any CUDA-graph capture region: a captured director launch reads
+    step_dev each replay, so bumping it here is what makes the per-step RNG key vary across replays
+    (the launch bakes seed/rot_std/nb, which are constant per sim). For eager stepping this is just
+    the host providing `step` -- byte-identical to the old baked key0 = step*nb."""
+    if "_step_dev" not in g:
+        g["_step_dev"] = wp.zeros(1, dtype=wp.int32, device=g["device"])
+    g["_step_dev"].fill_(int(step))
+
+
+def _launch_director_update(g: dict, phys: dict, dr: float, dt: float, seed: int) -> None:
+    """Launch the director kernel (reads g['_step_dev'] for the per-step key). CAPTURE-SAFE: the
+    only per-step-varying input is the device scalar step_dev, so this launch goes inside a captured
+    step graph while set_director_step runs between replays. Requires set_director_step to have run
+    at least once (it allocates _step_dev)."""
     rot_std = float(np.sqrt(2.0 * dr * dt))
     wp.launch(director_update_kernel, dim=g["nb"], device=g["device"],
               inputs=[g["body_alive"], wp.float64(rot_std), wp.int32(int(seed)),
-                      wp.int32(int(step) * g["nb"]), phys["body_director"]])
+                      g["_step_dev"], wp.int32(int(g["nb"])), phys["body_director"]])
+
+
+def director_update_warp(g: dict, phys: dict, dr: float, dt: float, seed: int, step: int) -> None:
+    """Evolve every body's director by one rotational-diffusion step (mutates
+    phys['body_director'] in place). `step` makes the per-body RNG key unique across steps; it is
+    routed through a device scalar (g['_step_dev']) so the same launch can be CUDA-graph-captured and
+    replayed with a per-step-varying seed (set_director_step bumps step_dev between replays). Eager
+    callers get the old behavior byte-for-byte."""
+    set_director_step(g, step)
+    _launch_director_update(g, phys, dr, dt, seed)
 
 
 # --------------------------------------------------------------------------------------
